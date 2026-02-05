@@ -208,8 +208,7 @@ class TelegramChannel(BaseChannel):
         
         user = update.effective_user
         await update.message.reply_text(
-            f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
-            "Send me a message and I'll respond!"
+            f"👋 Hi {user.first_name}!"
         )
     
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
