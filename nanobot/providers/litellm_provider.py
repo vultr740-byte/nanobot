@@ -202,6 +202,14 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
+            if isinstance(e, httpx.HTTPStatusError):
+                headers = self._select_response_headers(e.response.headers)
+                if headers:
+                    logger.error(
+                        "LLM response headers: id={} headers={}",
+                        request_id,
+                        headers,
+                    )
             if debug:
                 logger.exception(
                     "LLM request failed: id={} model={} api_base={} is_vllm={}",
@@ -235,6 +243,7 @@ class LiteLLMProvider(LLMProvider):
                 body = e.response.text or ""
                 if len(body) > 2000:
                     body = f"{body[:2000]}...(truncated)"
+                headers = self._select_response_headers(e.response.headers)
                 logger.error(
                     "Chat completions HTTP error: id={} status={} url={} body={}",
                     request_id,
@@ -242,6 +251,12 @@ class LiteLLMProvider(LLMProvider):
                     e.request.url,
                     body,
                 )
+                if headers:
+                    logger.error(
+                        "Chat completions HTTP headers: id={} headers={}",
+                        request_id,
+                        headers,
+                    )
                 raise
 
     @staticmethod
@@ -301,6 +316,15 @@ class LiteLLMProvider(LLMProvider):
             out[key] = value
 
         return out
+
+    @staticmethod
+    def _select_response_headers(headers: Any) -> dict[str, str]:
+        if not headers:
+            return {}
+        try:
+            return dict(headers)
+        except Exception:
+            return {key: headers.get(key) for key in headers}
 
     @staticmethod
     def _build_chat_completions_url(api_base: str) -> str:

@@ -232,11 +232,17 @@ class AgentLoop:
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
         self.sessions.save(session)
+
+        outbound_metadata = {}
+        thinking_message_id = msg.metadata.get("thinking_message_id")
+        if thinking_message_id:
+            outbound_metadata["edit_message_id"] = thinking_message_id
         
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
-            content=final_content
+            content=final_content,
+            metadata=outbound_metadata,
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -324,11 +330,17 @@ class AgentLoop:
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
         self.sessions.save(session)
+
+        outbound_metadata = {}
+        thinking_message_id = msg.metadata.get("thinking_message_id")
+        if thinking_message_id:
+            outbound_metadata["edit_message_id"] = thinking_message_id
         
         return OutboundMessage(
             channel=origin_channel,
             chat_id=origin_chat_id,
-            content=final_content
+            content=final_content,
+            metadata=outbound_metadata,
         )
     
     async def process_direct(self, content: str, session_key: str = "cli:direct") -> str:

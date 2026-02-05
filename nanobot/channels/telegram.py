@@ -160,8 +160,22 @@ class TelegramChannel(BaseChannel):
         try:
             # chat_id should be the Telegram chat ID (integer)
             chat_id = int(msg.chat_id)
+            edit_message_id = None
+            if msg.metadata:
+                edit_message_id = msg.metadata.get("edit_message_id")
             # Convert markdown to Telegram HTML
             html_content = _markdown_to_telegram_html(msg.content)
+            if edit_message_id:
+                try:
+                    await self._app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=int(edit_message_id),
+                        text=html_content,
+                        parse_mode="HTML"
+                    )
+                    return
+                except Exception as e:
+                    logger.warning(f"Error editing Telegram message: {e}")
             await self._app.bot.send_message(
                 chat_id=chat_id,
                 text=html_content,
@@ -173,6 +187,13 @@ class TelegramChannel(BaseChannel):
             # Fallback to plain text if HTML parsing fails
             logger.warning(f"HTML parse failed, falling back to plain text: {e}")
             try:
+                if msg.metadata and msg.metadata.get("edit_message_id"):
+                    await self._app.bot.edit_message_text(
+                        chat_id=int(msg.chat_id),
+                        message_id=int(msg.metadata.get("edit_message_id")),
+                        text=msg.content
+                    )
+                    return
                 await self._app.bot.send_message(
                     chat_id=int(msg.chat_id),
                     text=msg.content
@@ -272,6 +293,17 @@ class TelegramChannel(BaseChannel):
         content = "\n".join(content_parts) if content_parts else "[empty message]"
         
         logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
+
+        thinking_message_id = None
+        try:
+            thinking_html = _markdown_to_telegram_html("🤖 思考中…")
+            thinking_msg = await message.reply_text(
+                thinking_html,
+                parse_mode="HTML"
+            )
+            thinking_message_id = thinking_msg.message_id
+        except Exception as e:
+            logger.warning(f"Failed to send thinking message: {e}")
         
         # Forward to the message bus
         await self._handle_message(
@@ -284,7 +316,8 @@ class TelegramChannel(BaseChannel):
                 "user_id": user.id,
                 "username": user.username,
                 "first_name": user.first_name,
-                "is_group": message.chat.type != "private"
+                "is_group": message.chat.type != "private",
+                "thinking_message_id": thinking_message_id,
             }
         )
     
