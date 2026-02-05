@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 import httpx
+import uuid
 import litellm
 from litellm import acompletion
 from loguru import logger
@@ -90,6 +91,7 @@ class LiteLLMProvider(LLMProvider):
         model = model or self.default_model
 
         debug = os.getenv("NANOBOT_LLM_DEBUG", "").lower() in ("1", "true", "yes")
+        request_id = uuid.uuid4().hex[:8]
         
         # For OpenRouter, prefix model name if not already prefixed
         if self.is_openrouter and not model.startswith("openrouter/"):
@@ -153,13 +155,20 @@ class LiteLLMProvider(LLMProvider):
 
         if debug:
             logger.info(
-                "LLM request: model={} api_base={} is_vllm={} is_openrouter={} messages={} tools={}",
+                "LLM request: id={} model={} api_base={} is_vllm={} is_openrouter={} messages={} tools={}",
+                request_id,
                 model,
                 self.api_base or "default",
                 self.is_vllm,
                 self.is_openrouter,
                 len(messages),
                 bool(tools),
+            )
+            logger.info(
+                "LLM route: id={} force_chat_completions={} strip_temperature={}",
+                request_id,
+                self.force_chat_completions,
+                self.strip_temperature,
             )
             if removed_keys:
                 logger.info("LLM tools schema sanitized (removed keys: {})", ",".join(sorted(removed_keys)))
@@ -172,14 +181,15 @@ class LiteLLMProvider(LLMProvider):
 
         try:
             if self.force_chat_completions and self.api_base:
-                response = await self._chat_completions_httpx(kwargs)
+                response = await self._chat_completions_httpx(kwargs, request_id=request_id)
                 return self._parse_response_dict(response)
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
             if debug:
                 logger.exception(
-                    "LLM request failed: model={} api_base={} is_vllm={}",
+                    "LLM request failed: id={} model={} api_base={} is_vllm={}",
+                    request_id,
                     model,
                     self.api_base or "default",
                     self.is_vllm,
@@ -190,7 +200,7 @@ class LiteLLMProvider(LLMProvider):
                 finish_reason="error",
             )
 
-    async def _chat_completions_httpx(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    async def _chat_completions_httpx(self, kwargs: dict[str, Any], request_id: str) -> dict[str, Any]:
         url = self._build_chat_completions_url(self.api_base or "")
         payload = {k: v for k, v in kwargs.items() if k not in {"api_key", "api_base"}}
         headers = {
@@ -201,9 +211,22 @@ class LiteLLMProvider(LLMProvider):
 
         timeout = httpx.Timeout(60.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            return response.json()
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                body = e.response.text or ""
+                if len(body) > 2000:
+                    body = f"{body[:2000]}...(truncated)"
+                logger.error(
+                    "Chat completions HTTP error: id={} status={} url={} body={}",
+                    request_id,
+                    e.response.status_code,
+                    e.request.url,
+                    body,
+                )
+                raise
 
     @staticmethod
     def _build_chat_completions_url(api_base: str) -> str:

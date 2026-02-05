@@ -180,6 +180,8 @@ class AgentLoop:
             
             # Handle tool calls
             if response.has_tool_calls:
+                tool_names = ", ".join(tc.name for tc in response.tool_calls)
+                logger.info(f"Tool calls requested: {tool_names}")
                 # Add assistant message with tool calls
                 tool_call_dicts = [
                     {
@@ -201,6 +203,20 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result_type = type(result).__name__
+                    if isinstance(result, (str, bytes, list, dict)):
+                        logger.info(
+                            "Tool result: name={} type={} size={}",
+                            tool_call.name,
+                            result_type,
+                            len(result),
+                        )
+                    else:
+                        logger.info(
+                            "Tool result: name={} type={}",
+                            tool_call.name,
+                            result_type,
+                        )
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
