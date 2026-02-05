@@ -296,7 +296,7 @@ class TelegramChannel(BaseChannel):
 
         thinking_message_id = None
         try:
-            thinking_html = _markdown_to_telegram_html("🧑‍💻 你先别急…")
+            thinking_html = _markdown_to_telegram_html("🧑‍💻 思考中…")
             thinking_msg = await message.reply_text(
                 thinking_html,
                 parse_mode="HTML"
