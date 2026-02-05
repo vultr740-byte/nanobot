@@ -174,6 +174,9 @@ def gateway(
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     
     config = load_config()
+    config_path = get_config_path()
+    if config_path.exists():
+        console.print(f"[yellow]Config file detected:[/yellow] {config_path}")
     
     # Create components
     bus = MessageBus()
@@ -183,6 +186,10 @@ def gateway(
     api_base = config.get_api_base()
     model = config.agents.defaults.model
     is_bedrock = model.startswith("bedrock/")
+    
+    console.print(f"[dim]Model:[/dim] {model}")
+    console.print(f"[dim]API base:[/dim] {api_base or 'default'}")
+    console.print(f"[dim]API key set:[/dim] {'yes' if api_key else 'no'}")
 
     if not api_key and not is_bedrock:
         console.print("[red]Error: No API key configured.[/red]")

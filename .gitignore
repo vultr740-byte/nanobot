@@ -13,3 +13,6 @@ docs/
 *.pyz
 *.pywz
 *.pyzz
+scripts/test-api.sh
+scripts/test-coincoin-python.py
+scripts/test-coincoin.js
