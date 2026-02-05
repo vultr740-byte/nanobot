@@ -1,5 +1,6 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import json
 import os
 from typing import Any
 
@@ -178,6 +179,21 @@ class LiteLLMProvider(LLMProvider):
                 bool(os.environ.get("OPENROUTER_API_KEY")),
                 bool(os.environ.get("ANTHROPIC_API_KEY")),
             )
+            try:
+                payload = {k: v for k, v in kwargs.items() if k not in {"api_key", "api_base"}}
+                payload_bytes = len(json.dumps(payload, ensure_ascii=True))
+                redacted_payload = self._redact_payload(payload)
+                redacted_json = json.dumps(redacted_payload, ensure_ascii=True)
+                if len(redacted_json) > 4000:
+                    redacted_json = f"{redacted_json[:4000]}...(truncated)"
+                logger.info(
+                    "LLM payload: id={} bytes={} json={}",
+                    request_id,
+                    payload_bytes,
+                    redacted_json,
+                )
+            except Exception:
+                logger.exception("LLM payload log failed: id={}", request_id)
 
         try:
             if self.force_chat_completions and self.api_base:
@@ -227,6 +243,64 @@ class LiteLLMProvider(LLMProvider):
                     body,
                 )
                 raise
+
+    @staticmethod
+    def _redact_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        def _truncate(value: Any, limit: int = 500) -> Any:
+            if value is None:
+                return None
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=True)
+            if len(text) <= limit:
+                return text
+            return f"{text[:limit]}...(truncated)"
+
+        out: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key == "messages" and isinstance(value, list):
+                messages = []
+                for msg in value:
+                    if not isinstance(msg, dict):
+                        messages.append(_truncate(msg))
+                        continue
+                    item: dict[str, Any] = {}
+                    for field in ("role", "name", "tool_call_id"):
+                        if field in msg:
+                            item[field] = msg[field]
+                    if "content" in msg:
+                        item["content"] = _truncate(msg["content"])
+                    if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+                        calls = []
+                        for tc in msg["tool_calls"]:
+                            fn = tc.get("function") if isinstance(tc, dict) else None
+                            args = fn.get("arguments") if isinstance(fn, dict) else None
+                            calls.append({
+                                "name": fn.get("name") if isinstance(fn, dict) else None,
+                                "arguments_size": len(args) if isinstance(args, str) else len(json.dumps(args, ensure_ascii=True)) if args is not None else 0,
+                            })
+                        item["tool_calls"] = calls
+                    messages.append(item)
+                out[key] = messages
+                continue
+
+            if key == "tools" and isinstance(value, list):
+                tools = []
+                for tool in value:
+                    if not isinstance(tool, dict):
+                        tools.append({"type": type(tool).__name__})
+                        continue
+                    fn = tool.get("function", {})
+                    params = fn.get("parameters") if isinstance(fn, dict) else None
+                    props = params.get("properties", {}) if isinstance(params, dict) else {}
+                    tools.append({
+                        "name": fn.get("name") if isinstance(fn, dict) else None,
+                        "params": list(props.keys()),
+                    })
+                out[key] = tools
+                continue
+
+            out[key] = value
+
+        return out
 
     @staticmethod
     def _build_chat_completions_url(api_base: str) -> str:
