@@ -114,6 +114,11 @@ class LiteLLMProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+
+        # Ensure LiteLLM uses the provided key for custom endpoints.
+        # Some LiteLLM paths default to a placeholder key if api_key isn't explicit.
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
         
         # Pass api_base directly for custom endpoints (vLLM, etc.)
         if self.api_base:
