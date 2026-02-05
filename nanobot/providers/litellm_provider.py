@@ -125,7 +125,24 @@ class LiteLLMProvider(LLMProvider):
             kwargs["api_base"] = self.api_base
         
         if tools:
-            kwargs["tools"] = tools
+            # Some OpenAI-compatible proxies reject advanced JSON Schema keywords.
+            removed_keys: set[str] = set()
+
+            def _sanitize(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    out = {}
+                    for k, v in obj.items():
+                        if k in {"default", "minimum", "maximum"}:
+                            removed_keys.add(k)
+                            continue
+                        out[k] = _sanitize(v)
+                    return out
+                if isinstance(obj, list):
+                    return [_sanitize(item) for item in obj]
+                return obj
+
+            sanitized_tools = _sanitize(tools)
+            kwargs["tools"] = sanitized_tools
             kwargs["tool_choice"] = "auto"
 
         if debug:
@@ -138,6 +155,8 @@ class LiteLLMProvider(LLMProvider):
                 len(messages),
                 bool(tools),
             )
+            if removed_keys:
+                logger.info("LLM tools schema sanitized (removed keys: {})", ",".join(sorted(removed_keys)))
             logger.info(
                 "LLM env keys set: OPENAI_API_KEY={} OPENROUTER_API_KEY={} ANTHROPIC_API_KEY={}",
                 bool(os.environ.get("OPENAI_API_KEY")),
