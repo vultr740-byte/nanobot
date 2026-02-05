@@ -5,6 +5,7 @@ from typing import Any
 
 import litellm
 from litellm import acompletion
+from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
@@ -82,6 +83,8 @@ class LiteLLMProvider(LLMProvider):
             LLMResponse with content and/or tool calls.
         """
         model = model or self.default_model
+
+        debug = os.getenv("NANOBOT_LLM_DEBUG", "").lower() in ("1", "true", "yes")
         
         # For OpenRouter, prefix model name if not already prefixed
         if self.is_openrouter and not model.startswith("openrouter/"):
@@ -119,11 +122,35 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+
+        if debug:
+            logger.info(
+                "LLM request: model={} api_base={} is_vllm={} is_openrouter={} messages={} tools={}",
+                model,
+                self.api_base or "default",
+                self.is_vllm,
+                self.is_openrouter,
+                len(messages),
+                bool(tools),
+            )
+            logger.info(
+                "LLM env keys set: OPENAI_API_KEY={} OPENROUTER_API_KEY={} ANTHROPIC_API_KEY={}",
+                bool(os.environ.get("OPENAI_API_KEY")),
+                bool(os.environ.get("OPENROUTER_API_KEY")),
+                bool(os.environ.get("ANTHROPIC_API_KEY")),
+            )
         
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
+            if debug:
+                logger.exception(
+                    "LLM request failed: model={} api_base={} is_vllm={}",
+                    model,
+                    self.api_base or "default",
+                    self.is_vllm,
+                )
             # Return error as content for graceful handling
             return LLMResponse(
                 content=f"Error calling LLM: {str(e)}",
