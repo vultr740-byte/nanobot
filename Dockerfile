@@ -36,5 +36,9 @@ RUN mkdir -p /root/.nanobot
 # Gateway default port
 EXPOSE 18790
 
-ENTRYPOINT ["nanobot"]
-CMD ["status"]
+# Default to running the gateway; allow PORT from platform
+COPY entrypoint.sh /usr/local/bin/nanobot-entrypoint
+RUN chmod +x /usr/local/bin/nanobot-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/nanobot-entrypoint"]
+CMD []
