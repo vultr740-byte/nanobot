@@ -196,10 +196,15 @@ def gateway(
         console.print("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey")
         raise typer.Exit(1)
     
+    provider_config = config.get_active_provider_config()
+    force_chat_completions = bool(provider_config and provider_config.force_chat_completions)
+    strip_temperature = bool(provider_config and provider_config.strip_temperature)
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
-        default_model=config.agents.defaults.model
+        default_model=config.agents.defaults.model,
+        force_chat_completions=force_chat_completions,
+        strip_temperature=strip_temperature,
     )
     
     # Create agent
@@ -307,10 +312,15 @@ def agent(
         raise typer.Exit(1)
 
     bus = MessageBus()
+    provider_config = config.get_active_provider_config()
+    force_chat_completions = bool(provider_config and provider_config.force_chat_completions)
+    strip_temperature = bool(provider_config and provider_config.strip_temperature)
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
-        default_model=config.agents.defaults.model
+        default_model=config.agents.defaults.model,
+        force_chat_completions=force_chat_completions,
+        strip_temperature=strip_temperature,
     )
     
     agent_loop = AgentLoop(

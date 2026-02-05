@@ -43,6 +43,8 @@ class ProviderConfig(BaseModel):
     """LLM provider configuration."""
     api_key: str = ""
     api_base: str | None = None
+    force_chat_completions: bool = False
+    strip_temperature: bool = False
 
 
 class ProvidersConfig(BaseModel):
@@ -121,6 +123,24 @@ class Config(BaseSettings):
             return self.providers.zhipu.api_base
         if self.providers.vllm.api_base:
             return self.providers.vllm.api_base
+        return None
+
+    def get_active_provider_config(self) -> ProviderConfig | None:
+        """Get the active provider config based on API key priority."""
+        if self.providers.openrouter.api_key:
+            return self.providers.openrouter
+        if self.providers.anthropic.api_key:
+            return self.providers.anthropic
+        if self.providers.openai.api_key:
+            return self.providers.openai
+        if self.providers.gemini.api_key:
+            return self.providers.gemini
+        if self.providers.zhipu.api_key:
+            return self.providers.zhipu
+        if self.providers.groq.api_key:
+            return self.providers.groq
+        if self.providers.vllm.api_key:
+            return self.providers.vllm
         return None
     
     class Config:

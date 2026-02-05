@@ -3,6 +3,7 @@
 import os
 from typing import Any
 
+import httpx
 import litellm
 from litellm import acompletion
 from loguru import logger
@@ -22,10 +23,14 @@ class LiteLLMProvider(LLMProvider):
         self, 
         api_key: str | None = None, 
         api_base: str | None = None,
-        default_model: str = "anthropic/claude-opus-4-5"
+        default_model: str = "anthropic/claude-opus-4-5",
+        force_chat_completions: bool = False,
+        strip_temperature: bool = False,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        self.force_chat_completions = force_chat_completions
+        self.strip_temperature = strip_temperature
         
         # Detect OpenRouter by api_key prefix or explicit api_base
         self.is_openrouter = (
@@ -143,6 +148,9 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = sanitized_tools
             kwargs["tool_choice"] = "auto"
 
+        if self.strip_temperature:
+            kwargs.pop("temperature", None)
+
         if debug:
             logger.info(
                 "LLM request: model={} api_base={} is_vllm={} is_openrouter={} messages={} tools={}",
@@ -161,8 +169,11 @@ class LiteLLMProvider(LLMProvider):
                 bool(os.environ.get("OPENROUTER_API_KEY")),
                 bool(os.environ.get("ANTHROPIC_API_KEY")),
             )
-        
+
         try:
+            if self.force_chat_completions and self.api_base:
+                response = await self._chat_completions_httpx(kwargs)
+                return self._parse_response_dict(response)
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
@@ -178,6 +189,85 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+
+    async def _chat_completions_httpx(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        url = self._build_chat_completions_url(self.api_base or "")
+        payload = {k: v for k, v in kwargs.items() if k not in {"api_key", "api_base"}}
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        timeout = httpx.Timeout(60.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return response.json()
+
+    @staticmethod
+    def _build_chat_completions_url(api_base: str) -> str:
+        base = api_base.rstrip("/")
+        if base.endswith("/chat/completions"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/chat/completions"
+        return f"{base}/v1/chat/completions"
+
+    def _parse_response_dict(self, response: dict[str, Any]) -> LLMResponse:
+        try:
+            choice = response["choices"][0]
+        except (KeyError, IndexError, TypeError):
+            return LLMResponse(
+                content=None,
+                finish_reason="error",
+            )
+
+        message = choice.get("message", {})
+        content = message.get("content")
+        finish_reason = choice.get("finish_reason") or "stop"
+
+        tool_calls: list[ToolCallRequest] = []
+        if isinstance(message, dict):
+            for tc in message.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    import json
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"raw": args}
+                tool_calls.append(ToolCallRequest(
+                    id=tc.get("id", ""),
+                    name=fn.get("name", ""),
+                    arguments=args or {},
+                ))
+            if not tool_calls and message.get("function_call"):
+                fn = message.get("function_call") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    import json
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"raw": args}
+                tool_calls.append(ToolCallRequest(
+                    id="",
+                    name=fn.get("name", ""),
+                    arguments=args or {},
+                ))
+
+        usage = {}
+        if isinstance(response.get("usage"), dict):
+            usage = response["usage"]
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
