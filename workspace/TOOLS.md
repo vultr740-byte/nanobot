@@ -71,8 +71,10 @@ web_fetch(url: str, extractMode: str = "markdown", maxChars: int = 50000) -> str
 ### message
 Send a message to the user (used internally).
 ```
-message(content: str, channel: str = None, chat_id: str = None) -> str
+message(content: str, media: list[str] = None, channel: str = None, chat_id: str = None) -> str
 ```
+
+`media` can be local file paths or URLs (Telegram supports direct URLs).
 
 ## Background Tasks
 

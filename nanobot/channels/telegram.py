@@ -1,10 +1,13 @@
 """Telegram channel implementation using python-telegram-bot."""
 
 import asyncio
+import mimetypes
 import re
+from pathlib import Path
+from urllib.parse import urlparse
 
 from loguru import logger
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 from nanobot.bus.events import OutboundMessage
@@ -139,6 +142,86 @@ class TelegramChannel(BaseChannel):
         # Keep running until stopped
         while self._running:
             await asyncio.sleep(1)
+
+    async def _send_media(self, chat_id: int, media_ref: str) -> None:
+        """Send a local file or URL as a Telegram media message."""
+        if not self._app:
+            return
+
+        is_url = self._is_url(media_ref)
+        media_type = self._guess_media_type(media_ref)
+
+        if is_url:
+            await self._send_remote_media(chat_id, media_ref, media_type)
+            return
+
+        path = Path(media_ref)
+        if not path.exists():
+            logger.warning(f"Media path not found: {media_ref}")
+            return
+
+        # Send local file without loading into memory
+        if media_type == "photo":
+            with path.open("rb") as f:
+                await self._app.bot.send_photo(chat_id=chat_id, photo=InputFile(f))
+            return
+        if media_type == "audio":
+            with path.open("rb") as f:
+                await self._app.bot.send_audio(chat_id=chat_id, audio=InputFile(f))
+            return
+        if media_type == "voice":
+            with path.open("rb") as f:
+                await self._app.bot.send_voice(chat_id=chat_id, voice=InputFile(f))
+            return
+
+        with path.open("rb") as f:
+            await self._app.bot.send_document(chat_id=chat_id, document=InputFile(f))
+
+    async def _send_remote_media(self, chat_id: int, url: str, media_type: str) -> None:
+        """Send a remote URL as Telegram media without downloading."""
+        if not self._app:
+            return
+
+        if media_type == "photo":
+            await self._app.bot.send_photo(chat_id=chat_id, photo=url)
+            return
+        if media_type == "audio":
+            await self._app.bot.send_audio(chat_id=chat_id, audio=url)
+            return
+        if media_type == "voice":
+            await self._app.bot.send_voice(chat_id=chat_id, voice=url)
+            return
+
+        await self._app.bot.send_document(chat_id=chat_id, document=url)
+
+    @staticmethod
+    def _is_url(value: str) -> bool:
+        try:
+            parsed = urlparse(value)
+            return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _guess_media_type(value: str) -> str:
+        """Infer Telegram media type from URL or file path."""
+        mime, _ = mimetypes.guess_type(value)
+        if mime:
+            if mime.startswith("image/"):
+                return "photo"
+            if mime.startswith("audio/"):
+                # Prefer voice for ogg/opus
+                if mime in {"audio/ogg", "audio/opus"} or value.lower().endswith(".ogg"):
+                    return "voice"
+                return "audio"
+        lower = value.lower()
+        if lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+            return "photo"
+        if lower.endswith((".ogg", ".opus")):
+            return "voice"
+        if lower.endswith((".mp3", ".m4a", ".wav", ".flac", ".aac")):
+            return "audio"
+        return "document"
     
     async def stop(self) -> None:
         """Stop the Telegram bot."""
@@ -156,50 +239,69 @@ class TelegramChannel(BaseChannel):
         if not self._app:
             logger.warning("Telegram bot not running")
             return
-        
+
         try:
             # chat_id should be the Telegram chat ID (integer)
             chat_id = int(msg.chat_id)
+        except ValueError:
+            logger.error(f"Invalid chat_id: {msg.chat_id}")
+            return
+
+        # 1) Send text content as a separate message (or edit if requested).
+        if msg.content:
             edit_message_id = None
             if msg.metadata:
                 edit_message_id = msg.metadata.get("edit_message_id")
-            # Convert markdown to Telegram HTML
-            html_content = _markdown_to_telegram_html(msg.content)
-            if edit_message_id:
-                try:
-                    await self._app.bot.edit_message_text(
+            try:
+                html_content = _markdown_to_telegram_html(msg.content)
+                if edit_message_id:
+                    try:
+                        await self._app.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=int(edit_message_id),
+                            text=html_content,
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error editing Telegram message: {e}")
+                        await self._app.bot.send_message(
+                            chat_id=chat_id,
+                            text=html_content,
+                            parse_mode="HTML"
+                        )
+                else:
+                    await self._app.bot.send_message(
                         chat_id=chat_id,
-                        message_id=int(edit_message_id),
                         text=html_content,
                         parse_mode="HTML"
                     )
-                    return
-                except Exception as e:
-                    logger.warning(f"Error editing Telegram message: {e}")
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=html_content,
-                parse_mode="HTML"
-            )
-        except ValueError:
-            logger.error(f"Invalid chat_id: {msg.chat_id}")
-        except Exception as e:
-            # Fallback to plain text if HTML parsing fails
-            logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+            except Exception as e:
+                # Fallback to plain text if HTML parsing fails
+                logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+                try:
+                    if edit_message_id:
+                        await self._app.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=int(edit_message_id),
+                            text=msg.content
+                        )
+                    else:
+                        await self._app.bot.send_message(
+                            chat_id=chat_id,
+                            text=msg.content
+                        )
+                except Exception as e2:
+                    logger.error(f"Error sending Telegram message: {e2}")
+
+        # 2) Send media attachments as separate messages.
+        if not msg.media:
+            return
+
+        for item in msg.media:
             try:
-                if msg.metadata and msg.metadata.get("edit_message_id"):
-                    await self._app.bot.edit_message_text(
-                        chat_id=int(msg.chat_id),
-                        message_id=int(msg.metadata.get("edit_message_id")),
-                        text=msg.content
-                    )
-                    return
-                await self._app.bot.send_message(
-                    chat_id=int(msg.chat_id),
-                    text=msg.content
-                )
-            except Exception as e2:
-                logger.error(f"Error sending Telegram message: {e2}")
+                await self._send_media(chat_id, item)
+            except Exception as e:
+                logger.error(f"Error sending media {item}: {e}")
     
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -262,7 +364,6 @@ class TelegramChannel(BaseChannel):
                 ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
                 
                 # Save to workspace/media/
-                from pathlib import Path
                 media_dir = Path.home() / ".nanobot" / "media"
                 media_dir.mkdir(parents=True, exist_ok=True)
                 
