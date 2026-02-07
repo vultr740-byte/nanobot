@@ -1,6 +1,8 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
+import os
 from pathlib import Path
 
 import typer
@@ -152,13 +154,25 @@ def _build_web_search_settings(config):
     web_cfg = config.tools.web.search
     provider = web_cfg.provider
     active_provider = config.get_active_provider_name()
+    provider_explicit = bool(os.getenv("NANOBOT_TOOLS__WEB__SEARCH__PROVIDER"))
+    if not provider_explicit:
+        try:
+            from nanobot.config.loader import get_config_path
+            config_path = get_config_path()
+            if config_path.exists():
+                with open(config_path) as f:
+                    raw = json.load(f)
+                search_cfg = raw.get("tools", {}).get("web", {}).get("search", {})
+                provider_explicit = isinstance(search_cfg, dict) and "provider" in search_cfg
+        except Exception:
+            provider_explicit = False
 
     # Auto-default to OpenAI web search when only OpenAI is viable.
     if (
         provider == "brave"
         and active_provider == "openai"
-        and not web_cfg.api_key
         and config.providers.openai.api_key
+        and not provider_explicit
     ):
         provider = "openai"
 

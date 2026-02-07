@@ -475,7 +475,7 @@ class LiteLLMProvider(LLMProvider):
         if self.openai_web_search:
             tools_payload.append(self._build_openai_web_search_tool())
         if tools:
-            tools_payload.extend(tools)
+            tools_payload.extend(self._convert_tools_for_responses(tools))
         if tools_payload:
             payload["tools"] = tools_payload
             payload["tool_choice"] = "auto"
@@ -506,6 +506,32 @@ class LiteLLMProvider(LLMProvider):
             tool["external_web_access"] = bool(self.openai_web_search_config["external_web_access"])
 
         return tool
+
+    def _convert_tools_for_responses(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "function":
+                fn = tool.get("function")
+                if isinstance(fn, dict):
+                    name = fn.get("name")
+                    if not name:
+                        continue
+                    out: dict[str, Any] = {"type": "function", "name": name}
+                    description = fn.get("description")
+                    parameters = fn.get("parameters")
+                    if description:
+                        out["description"] = description
+                    if parameters is not None:
+                        out["parameters"] = parameters
+                    converted.append(out)
+                    continue
+                if tool.get("name"):
+                    converted.append(tool)
+                continue
+            converted.append(tool)
+        return converted
 
     async def _responses_httpx(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
         url = self._build_responses_url(self.api_base or "")

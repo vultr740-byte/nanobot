@@ -17,3 +17,4 @@ scripts/test-api.sh
 scripts/test-coincoin-python.py
 scripts/test-coincoin.js
 scripts/test-coincoin-tools.js
+.DS_Store
