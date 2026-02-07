@@ -45,12 +45,15 @@ exec(command: str, working_dir: str = None) -> str
 ## Web Access
 
 ### web_search
-Search the web using Brave Search API.
+Search the web (Brave Search API when configured).
 ```
 web_search(query: str, count: int = 5) -> str
 ```
 
-Returns search results with titles, URLs, and snippets. Requires `tools.web.search.apiKey` in config.
+Returns search results with titles, URLs, and snippets. Requires `tools.web.search.apiKey` and
+`tools.web.search.provider = "brave"` in config. If `provider = "openai"`, web search is handled
+by OpenAI's built-in tool (no local `web_search` function). If no provider is set and only an
+OpenAI key is configured, web search defaults to OpenAI.
 
 ### web_fetch
 Fetch and extract main content from a URL.

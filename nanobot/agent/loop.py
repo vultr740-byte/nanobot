@@ -41,6 +41,7 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 20,
         brave_api_key: str | None = None,
+        web_search_provider: str = "brave",
         exec_config: "ExecToolConfig | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
@@ -50,6 +51,7 @@ class AgentLoop:
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
         self.brave_api_key = brave_api_key
+        self.web_search_provider = web_search_provider
         self.exec_config = exec_config or ExecToolConfig()
         
         self.context = ContextBuilder(workspace)
@@ -61,6 +63,7 @@ class AgentLoop:
             bus=bus,
             model=self.model,
             brave_api_key=brave_api_key,
+            web_search_provider=web_search_provider,
             exec_config=self.exec_config,
         )
         
@@ -83,7 +86,8 @@ class AgentLoop:
         ))
         
         # Web tools
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
+        if self.web_search_provider == "brave" and self.brave_api_key:
+            self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
         
         # Message tool

@@ -85,7 +85,9 @@ pip install nanobot-ai
 
 > [!TIP]
 > Set your API key in `~/.nanobot/config.json`.
-> Get API keys: [OpenRouter](https://openrouter.ai/keys) (LLM) · [Brave Search](https://brave.com/search/api/) (optional, for web search)
+> Get API keys: [OpenRouter](https://openrouter.ai/keys) (LLM) · [Brave Search](https://brave.com/search/api/) (optional, for Brave web search)
+> For OpenAI web search, set `tools.web.search.provider` to `"openai"` and use an OpenAI model.
+> If you only configure an OpenAI key (and no Brave key), web search will default to OpenAI.
 > You can also change the model to `minimax/minimax-m2` for lower cost.
 
 **1. Initialize**
@@ -111,6 +113,7 @@ nanobot onboard
   "tools": {
     "web": {
       "search": {
+        "provider": "brave",
         "apiKey": "BSA-xxx"
       }
     }
@@ -291,6 +294,7 @@ Config file: `~/.nanobot/config.json`
   "tools": {
     "web": {
       "search": {
+        "provider": "brave",
         "apiKey": "BSA..."
       }
     }

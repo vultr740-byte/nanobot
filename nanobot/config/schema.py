@@ -1,6 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Literal
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
@@ -64,10 +65,26 @@ class GatewayConfig(BaseModel):
     port: int = 18790
 
 
+class WebSearchUserLocation(BaseModel):
+    """Approximate user location hints for OpenAI web search."""
+    type: Literal["approximate"] = "approximate"
+    city: str | None = None
+    region: str | None = None
+    country: str | None = None
+    timezone: str | None = None
+
+
 class WebSearchConfig(BaseModel):
     """Web search tool configuration."""
+    provider: Literal["brave", "openai", "disabled"] = "brave"
     api_key: str = ""  # Brave Search API key
     max_results: int = 5
+    # OpenAI web search options
+    search_context_size: Literal["low", "medium", "high"] = "medium"
+    allowed_domains: list[str] = Field(default_factory=list)
+    include_sources: bool = False
+    external_web_access: bool | None = None
+    user_location: WebSearchUserLocation | None = None
 
 
 class WebToolsConfig(BaseModel):
@@ -141,6 +158,24 @@ class Config(BaseSettings):
             return self.providers.groq
         if self.providers.vllm.api_key:
             return self.providers.vllm
+        return None
+
+    def get_active_provider_name(self) -> str | None:
+        """Get the active provider name based on API key priority."""
+        if self.providers.openrouter.api_key:
+            return "openrouter"
+        if self.providers.anthropic.api_key:
+            return "anthropic"
+        if self.providers.openai.api_key:
+            return "openai"
+        if self.providers.gemini.api_key:
+            return "gemini"
+        if self.providers.zhipu.api_key:
+            return "zhipu"
+        if self.providers.groq.api_key:
+            return "groq"
+        if self.providers.vllm.api_key:
+            return "vllm"
         return None
     
     class Config:

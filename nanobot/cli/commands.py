@@ -147,6 +147,36 @@ This file stores important information that should persist across sessions.
         console.print("  [dim]Created memory/MEMORY.md[/dim]")
 
 
+def _build_web_search_settings(config):
+    """Build web search provider settings from config."""
+    web_cfg = config.tools.web.search
+    provider = web_cfg.provider
+    active_provider = config.get_active_provider_name()
+
+    # Auto-default to OpenAI web search when only OpenAI is viable.
+    if (
+        provider == "brave"
+        and active_provider == "openai"
+        and not web_cfg.api_key
+        and config.providers.openai.api_key
+    ):
+        provider = "openai"
+
+    openai_settings = None
+    if provider == "openai":
+        openai_settings = {
+            "search_context_size": web_cfg.search_context_size,
+            "allowed_domains": web_cfg.allowed_domains,
+            "include_sources": web_cfg.include_sources,
+        }
+        if web_cfg.external_web_access is not None:
+            openai_settings["external_web_access"] = web_cfg.external_web_access
+        if web_cfg.user_location:
+            openai_settings["user_location"] = web_cfg.user_location.model_dump(exclude_none=True)
+
+    return provider, openai_settings
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -199,12 +229,17 @@ def gateway(
     provider_config = config.get_active_provider_config()
     force_chat_completions = bool(provider_config and provider_config.force_chat_completions)
     strip_temperature = bool(provider_config and provider_config.strip_temperature)
+    web_search_provider, openai_web_search_config = _build_web_search_settings(config)
+    provider_name = config.get_active_provider_name()
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
         default_model=config.agents.defaults.model,
         force_chat_completions=force_chat_completions,
         strip_temperature=strip_temperature,
+        provider_name=provider_name,
+        openai_web_search=web_search_provider == "openai",
+        openai_web_search_config=openai_web_search_config,
     )
     
     # Create agent
@@ -215,6 +250,7 @@ def gateway(
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=web_search_provider,
         exec_config=config.tools.exec,
     )
     
@@ -315,12 +351,17 @@ def agent(
     provider_config = config.get_active_provider_config()
     force_chat_completions = bool(provider_config and provider_config.force_chat_completions)
     strip_temperature = bool(provider_config and provider_config.strip_temperature)
+    web_search_provider, openai_web_search_config = _build_web_search_settings(config)
+    provider_name = config.get_active_provider_name()
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
         default_model=config.agents.defaults.model,
         force_chat_completions=force_chat_completions,
         strip_temperature=strip_temperature,
+        provider_name=provider_name,
+        openai_web_search=web_search_provider == "openai",
+        openai_web_search_config=openai_web_search_config,
     )
     
     agent_loop = AgentLoop(
@@ -328,6 +369,7 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=web_search_provider,
         exec_config=config.tools.exec,
     )
     

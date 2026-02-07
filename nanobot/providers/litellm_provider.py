@@ -28,11 +28,17 @@ class LiteLLMProvider(LLMProvider):
         default_model: str = "anthropic/claude-opus-4-5",
         force_chat_completions: bool = False,
         strip_temperature: bool = False,
+        provider_name: str | None = None,
+        openai_web_search: bool = False,
+        openai_web_search_config: dict[str, Any] | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.force_chat_completions = force_chat_completions
         self.strip_temperature = strip_temperature
+        self.provider_name = provider_name
+        self.openai_web_search = openai_web_search
+        self.openai_web_search_config = openai_web_search_config or {}
         
         # Detect OpenRouter by api_key prefix or explicit api_base
         self.is_openrouter = (
@@ -114,6 +120,91 @@ class LiteLLMProvider(LLMProvider):
         if "gemini" in model.lower() and not model.startswith("gemini/"):
             model = f"gemini/{model}"
         
+        removed_keys: set[str] = set()
+        sanitized_tools = None
+        if tools:
+            # Some OpenAI-compatible proxies reject advanced JSON Schema keywords.
+            def _sanitize(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    out = {}
+                    for k, v in obj.items():
+                        if k in {"default", "minimum", "maximum"}:
+                            removed_keys.add(k)
+                            continue
+                        out[k] = _sanitize(v)
+                    return out
+                if isinstance(obj, list):
+                    return [_sanitize(item) for item in obj]
+                return obj
+
+            sanitized_tools = _sanitize(tools)
+
+        if self.openai_web_search and self._should_use_openai_responses(model):
+            payload = self._build_responses_payload(
+                messages=messages,
+                tools=sanitized_tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            if self.strip_temperature:
+                payload.pop("temperature", None)
+
+            if debug:
+                logger.info(
+                    "LLM request (responses): id={} model={} api_base={} messages={} tools={} web_search={}",
+                    request_id,
+                    model,
+                    self.api_base or "default",
+                    len(messages),
+                    bool(sanitized_tools),
+                    True,
+                )
+                logger.info(
+                    "LLM route: id={} force_chat_completions={} strip_temperature={}",
+                    request_id,
+                    self.force_chat_completions,
+                    self.strip_temperature,
+                )
+                if removed_keys:
+                    logger.info("LLM tools schema sanitized (removed keys: {})", ",".join(sorted(removed_keys)))
+                logger.info(
+                    "LLM env keys set: OPENAI_API_KEY={} OPENROUTER_API_KEY={} ANTHROPIC_API_KEY={}",
+                    bool(os.environ.get("OPENAI_API_KEY")),
+                    bool(os.environ.get("OPENROUTER_API_KEY")),
+                    bool(os.environ.get("ANTHROPIC_API_KEY")),
+                )
+                try:
+                    payload_bytes = len(json.dumps(payload, ensure_ascii=True))
+                    redacted_payload = self._redact_payload(payload)
+                    redacted_json = json.dumps(redacted_payload, ensure_ascii=True)
+                    if len(redacted_json) > 4000:
+                        redacted_json = f"{redacted_json[:4000]}...(truncated)"
+                    logger.info(
+                        "LLM payload (responses): id={} bytes={} json={}",
+                        request_id,
+                        payload_bytes,
+                        redacted_json,
+                    )
+                except Exception:
+                    logger.exception("LLM payload log failed: id={}", request_id)
+
+            try:
+                response = await self._responses_httpx(payload, request_id=request_id)
+                return self._parse_responses_dict(response)
+            except Exception as e:
+                if debug:
+                    logger.exception(
+                        "LLM responses request failed: id={} model={} api_base={}",
+                        request_id,
+                        model,
+                        self.api_base or "default",
+                    )
+                return LLMResponse(
+                    content=f"Error calling LLM: {str(e)}",
+                    finish_reason="error",
+                )
+
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -130,24 +221,7 @@ class LiteLLMProvider(LLMProvider):
         if self.api_base:
             kwargs["api_base"] = self.api_base
         
-        if tools:
-            # Some OpenAI-compatible proxies reject advanced JSON Schema keywords.
-            removed_keys: set[str] = set()
-
-            def _sanitize(obj: Any) -> Any:
-                if isinstance(obj, dict):
-                    out = {}
-                    for k, v in obj.items():
-                        if k in {"default", "minimum", "maximum"}:
-                            removed_keys.add(k)
-                            continue
-                        out[k] = _sanitize(v)
-                    return out
-                if isinstance(obj, list):
-                    return [_sanitize(item) for item in obj]
-                return obj
-
-            sanitized_tools = _sanitize(tools)
+        if sanitized_tools:
             kwargs["tools"] = sanitized_tools
             kwargs["tool_choice"] = "auto"
 
@@ -297,6 +371,32 @@ class LiteLLMProvider(LLMProvider):
                 out[key] = messages
                 continue
 
+            if key == "input" and isinstance(value, list):
+                items = []
+                for item in value:
+                    if not isinstance(item, dict):
+                        items.append(_truncate(item))
+                        continue
+                    entry: dict[str, Any] = {"type": item.get("type")}
+                    if "role" in item:
+                        entry["role"] = item.get("role")
+                    if item.get("type") == "message":
+                        content = item.get("content")
+                        if isinstance(content, list):
+                            entry["content_types"] = [
+                                part.get("type") for part in content if isinstance(part, dict)
+                            ]
+                        elif content is not None:
+                            entry["content"] = _truncate(content)
+                    if item.get("type") in {"function_call", "function_call_output"}:
+                        if "name" in item:
+                            entry["name"] = item.get("name")
+                        if "call_id" in item:
+                            entry["call_id"] = item.get("call_id")
+                    items.append(entry)
+                out[key] = items
+                continue
+
             if key == "tools" and isinstance(value, list):
                 tools = []
                 for tool in value:
@@ -334,6 +434,253 @@ class LiteLLMProvider(LLMProvider):
         if base.endswith("/v1"):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
+
+    @staticmethod
+    def _build_responses_url(api_base: str) -> str:
+        base = api_base.rstrip("/") if api_base else "https://api.openai.com"
+        if base.endswith("/responses"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/responses"
+        return f"{base}/v1/responses"
+
+    def _should_use_openai_responses(self, model: str) -> bool:
+        if self.provider_name is not None:
+            return self.provider_name == "openai"
+        if self.is_openrouter or self.is_vllm:
+            return False
+        model_lower = model.lower()
+        return "gpt" in model_lower or model_lower.startswith("o")
+
+    def _build_responses_payload(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> dict[str, Any]:
+        instructions, input_items = self._messages_to_responses_input(messages)
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": input_items,
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if instructions:
+            payload["instructions"] = instructions
+
+        tools_payload: list[dict[str, Any]] = []
+        if self.openai_web_search:
+            tools_payload.append(self._build_openai_web_search_tool())
+        if tools:
+            tools_payload.extend(tools)
+        if tools_payload:
+            payload["tools"] = tools_payload
+            payload["tool_choice"] = "auto"
+
+        include_sources = bool(self.openai_web_search_config.get("include_sources"))
+        if include_sources:
+            payload["include"] = ["web_search_call.action.sources"]
+
+        return payload
+
+    def _build_openai_web_search_tool(self) -> dict[str, Any]:
+        tool_type = self.openai_web_search_config.get("tool_type") or "web_search"
+        tool: dict[str, Any] = {"type": tool_type}
+
+        search_context_size = self.openai_web_search_config.get("search_context_size")
+        if search_context_size:
+            tool["search_context_size"] = search_context_size
+
+        allowed_domains = self.openai_web_search_config.get("allowed_domains") or []
+        if allowed_domains:
+            tool["filters"] = {"allowed_domains": allowed_domains}
+
+        user_location = self.openai_web_search_config.get("user_location")
+        if user_location:
+            tool["user_location"] = user_location
+
+        if "external_web_access" in self.openai_web_search_config:
+            tool["external_web_access"] = bool(self.openai_web_search_config["external_web_access"])
+
+        return tool
+
+    async def _responses_httpx(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        url = self._build_responses_url(self.api_base or "")
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        timeout = httpx.Timeout(60.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as e:
+                body = e.response.text or ""
+                if len(body) > 2000:
+                    body = f"{body[:2000]}...(truncated)"
+                headers = self._select_response_headers(e.response.headers)
+                logger.error(
+                    "Responses HTTP error: id={} status={} url={} body={}",
+                    request_id,
+                    e.response.status_code,
+                    e.request.url,
+                    body,
+                )
+                if headers:
+                    logger.error(
+                        "Responses HTTP headers: id={} headers={}",
+                        request_id,
+                        headers,
+                    )
+                raise
+
+    def _messages_to_responses_input(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        instructions = None
+        items: list[dict[str, Any]] = []
+
+        for idx, msg in enumerate(messages):
+            role = msg.get("role")
+            content = msg.get("content")
+
+            if idx == 0 and role == "system":
+                instructions = self._coerce_text(content)
+                continue
+
+            if role == "tool":
+                call_id = msg.get("tool_call_id") or ""
+                output = msg.get("content") or ""
+                if call_id:
+                    items.append({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    })
+                continue
+
+            if role == "assistant" and msg.get("tool_calls"):
+                for tc in msg.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments", "")
+                    if not isinstance(args, str):
+                        args = json.dumps(args, ensure_ascii=True)
+                    item: dict[str, Any] = {
+                        "type": "function_call",
+                        "name": fn.get("name") or "",
+                        "arguments": args,
+                    }
+                    call_id = tc.get("id")
+                    if call_id:
+                        item["call_id"] = call_id
+                    items.append(item)
+
+                if content:
+                    items.append(self._message_input_item(role, content))
+                continue
+
+            items.append(self._message_input_item(role, content))
+
+        return instructions, items
+
+    def _message_input_item(self, role: str | None, content: Any) -> dict[str, Any]:
+        safe_role = role if role in {"system", "developer", "user", "assistant"} else "user"
+        return {
+            "type": "message",
+            "role": safe_role,
+            "content": self._content_to_input_parts(content),
+        }
+
+    def _content_to_input_parts(self, content: Any) -> list[dict[str, Any]]:
+        if content is None:
+            return []
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+        if isinstance(content, list):
+            parts: list[dict[str, Any]] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "text":
+                    parts.append({"type": "input_text", "text": item.get("text", "")})
+                elif item_type == "image_url":
+                    image = item.get("image_url") or {}
+                    url = image.get("url") if isinstance(image, dict) else image
+                    if url:
+                        parts.append({"type": "input_image", "image_url": url})
+                elif item_type in {"input_text", "input_image"}:
+                    parts.append(item)
+            if parts:
+                return parts
+        return [{"type": "input_text", "text": self._coerce_text(content)}]
+
+    @staticmethod
+    def _coerce_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") in {"text", "input_text", "output_text"}:
+                    text = item.get("text")
+                    if text:
+                        parts.append(text)
+            if parts:
+                return " ".join(parts)
+        return str(content)
+
+    def _parse_responses_dict(self, response: dict[str, Any]) -> LLMResponse:
+        output = response.get("output") or []
+        content_parts: list[str] = []
+        tool_calls: list[ToolCallRequest] = []
+
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                for part in item.get("content") or []:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "output_text" and part.get("text"):
+                        content_parts.append(part["text"])
+            elif item_type == "function_call":
+                args = item.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"raw": args}
+                tool_calls.append(ToolCallRequest(
+                    id=item.get("call_id") or item.get("id") or "",
+                    name=item.get("name", ""),
+                    arguments=args or {},
+                ))
+
+        usage = {}
+        if isinstance(response.get("usage"), dict):
+            usage = response["usage"]
+
+        content = "\n".join([part for part in content_parts if part])
+        return LLMResponse(
+            content=content if content else None,
+            tool_calls=tool_calls,
+            finish_reason=response.get("status") or "stop",
+            usage=usage,
+        )
 
     def _parse_response_dict(self, response: dict[str, Any]) -> LLMResponse:
         try:
