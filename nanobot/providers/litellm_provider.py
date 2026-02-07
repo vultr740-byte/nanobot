@@ -624,32 +624,33 @@ class LiteLLMProvider(LLMProvider):
         return {
             "type": "message",
             "role": safe_role,
-            "content": self._content_to_input_parts(content),
+            "content": self._content_to_input_parts(content, safe_role),
         }
 
-    def _content_to_input_parts(self, content: Any) -> list[dict[str, Any]]:
+    def _content_to_input_parts(self, content: Any, role: str) -> list[dict[str, Any]]:
+        text_type = "output_text" if role == "assistant" else "input_text"
         if content is None:
             return []
         if isinstance(content, str):
-            return [{"type": "input_text", "text": content}]
+            return [{"type": text_type, "text": content}]
         if isinstance(content, list):
             parts: list[dict[str, Any]] = []
             for item in content:
                 if not isinstance(item, dict):
                     continue
                 item_type = item.get("type")
-                if item_type == "text":
-                    parts.append({"type": "input_text", "text": item.get("text", "")})
-                elif item_type == "image_url":
+                if item_type in {"text", "input_text", "output_text"}:
+                    parts.append({"type": text_type, "text": item.get("text", "")})
+                elif item_type == "image_url" and role != "assistant":
                     image = item.get("image_url") or {}
                     url = image.get("url") if isinstance(image, dict) else image
                     if url:
                         parts.append({"type": "input_image", "image_url": url})
-                elif item_type in {"input_text", "input_image"}:
+                elif item_type in {"input_text", "input_image"} and role != "assistant":
                     parts.append(item)
             if parts:
                 return parts
-        return [{"type": "input_text", "text": self._coerce_text(content)}]
+        return [{"type": text_type, "text": self._coerce_text(content)}]
 
     @staticmethod
     def _coerce_text(content: Any) -> str:
