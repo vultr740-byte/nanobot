@@ -93,9 +93,11 @@ Your workspace is at: {workspace_path}
 - Daily notes: {workspace_path}/memory/YYYY-MM-DD.md
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
-IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
-Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
-For normal conversation, just respond with text - do not call the message tool.
+IMPORTANT: For normal conversation, reply directly with your text response.
+Use the 'message' tool when you need to send via a specific chat channel OR when the user asks you to send files/attachments or other non-text media.
+If the user asks you to send a file and you have a local path or URL, call the message tool with `media` (list of paths or URLs). Keep `content` as a short caption or summary (it is required).
+If the user is in the current chat, you can omit `channel` and `chat_id` and the tool will target the current conversation.
+If you do not have a file path or URL, ask the user for it instead of requesting email/third-party upload targets.
 
 Always be helpful, accurate, and concise. When using tools, explain what you're doing.
 When remembering something, write to {workspace_path}/memory/MEMORY.md"""
