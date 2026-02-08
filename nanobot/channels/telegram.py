@@ -94,6 +94,13 @@ class _PendingTextEntry:
     timer: asyncio.Task | None = None
 
 
+@dataclass
+class _PendingFeedback:
+    chat_id: int
+    message_id: int | None
+    timer: asyncio.Task | None = None
+
+
 class TelegramChannel(BaseChannel):
     """
     Telegram channel using long polling.
@@ -110,8 +117,10 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._pending_lock = asyncio.Lock()
+        self._feedback_lock = asyncio.Lock()
         self._debounce_entries: dict[str, _PendingTextEntry] = {}
         self._text_fragment_entries: dict[str, _PendingTextEntry] = {}
+        self._pending_feedback: dict[int, _PendingFeedback] = {}
         # Debounce settings (ms) and text fragment stitching (OpenClaw-style defaults).
         self._debounce_ms = int(getattr(config, "debounce_ms", 600))
         self._text_fragment_start_threshold = int(getattr(config, "text_fragment_start_threshold", 4000))
@@ -119,6 +128,9 @@ class TelegramChannel(BaseChannel):
         self._text_fragment_max_id_gap = int(getattr(config, "text_fragment_max_id_gap", 1))
         self._text_fragment_max_parts = int(getattr(config, "text_fragment_max_parts", 12))
         self._text_fragment_max_total_chars = int(getattr(config, "text_fragment_max_total_chars", 50_000))
+        # Typing feedback reaction settings.
+        self._typing_feedback_delay_s = float(getattr(config, "typing_feedback_delay_s", 6.0))
+        self._typing_feedback_emoji = getattr(config, "typing_feedback_emoji", "") or "👀"
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -276,11 +288,56 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.debug(f"Failed to send typing action: {e}")
 
+    async def _send_reaction(self, chat_id: int, message_id: int, emoji: str) -> None:
+        if not self._app:
+            return
+        try:
+            await self._app.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=emoji,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to set reaction: {e}")
+
+    async def _schedule_feedback_reaction(self, chat_id: int, message_id: int | None) -> None:
+        if not message_id:
+            return
+        if self._typing_feedback_delay_s <= 0:
+            return
+        entry = _PendingFeedback(chat_id=chat_id, message_id=message_id)
+        async with self._feedback_lock:
+            existing = self._pending_feedback.get(chat_id)
+            if existing and existing.timer:
+                existing.timer.cancel()
+            entry.timer = asyncio.create_task(self._feedback_after_delay(chat_id, entry))
+            self._pending_feedback[chat_id] = entry
+
+    async def _feedback_after_delay(self, chat_id: int, entry: _PendingFeedback) -> None:
+        try:
+            await asyncio.sleep(self._typing_feedback_delay_s)
+        except asyncio.CancelledError:
+            return
+        async with self._feedback_lock:
+            current = self._pending_feedback.get(chat_id)
+            if current is not entry:
+                return
+            self._pending_feedback.pop(chat_id, None)
+        if entry.message_id:
+            await self._send_reaction(chat_id, entry.message_id, self._typing_feedback_emoji)
+
+    async def _cancel_feedback(self, chat_id: int) -> None:
+        async with self._feedback_lock:
+            entry = self._pending_feedback.pop(chat_id, None)
+            if entry and entry.timer:
+                entry.timer.cancel()
+
     async def _emit_text_entry(self, entry: _PendingTextEntry, joiner: str) -> None:
         content = joiner.join(entry.texts).strip()
         if not content:
             return
         await self._send_typing(entry.chat_id)
+        await self._schedule_feedback_reaction(entry.chat_id, entry.last_message_id)
         await self._handle_message(
             sender_id=entry.sender_id,
             chat_id=str(entry.chat_id),
@@ -399,6 +456,11 @@ class TelegramChannel(BaseChannel):
         for entry in pending:
             if entry.timer:
                 entry.timer.cancel()
+        async with self._feedback_lock:
+            for entry in self._pending_feedback.values():
+                if entry.timer:
+                    entry.timer.cancel()
+            self._pending_feedback.clear()
         
         if self._app:
             logger.info("Stopping Telegram bot...")
@@ -419,6 +481,8 @@ class TelegramChannel(BaseChannel):
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
             return
+
+        await self._cancel_feedback(chat_id)
 
         # 1) Send text content as a separate message (or edit if requested).
         if msg.content:
@@ -528,6 +592,7 @@ class TelegramChannel(BaseChannel):
         # Flush any pending text before handling media/commands to preserve ordering.
         await self._flush_pending_for_key(key)
         await self._send_typing(chat_id)
+        await self._schedule_feedback_reaction(chat_id, message.message_id)
         
         # Build content from text and/or media
         content_parts = []
