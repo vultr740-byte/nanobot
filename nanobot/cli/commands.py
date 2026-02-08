@@ -77,10 +77,25 @@ def onboard():
 
 
 
+def _load_workspace_template(filename: str, fallback: str) -> str:
+    """Load a workspace template from repo if available; otherwise use fallback."""
+    repo_root = Path(__file__).parent.parent.parent
+    template_path = repo_root / "workspace" / filename
+    if template_path.exists():
+        try:
+            return template_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return fallback
+
+
 def _create_workspace_templates(workspace: Path):
-    """Create default workspace template files."""
+    """Create default workspace template files (only if missing)."""
+    workspace.mkdir(parents=True, exist_ok=True)
     templates = {
-        "AGENTS.md": """# Agent Instructions
+        "AGENTS.md": _load_workspace_template(
+            "AGENTS.md",
+            """# Agent Instructions
 
 You are a helpful AI assistant. Be concise, accurate, and friendly.
 
@@ -90,8 +105,59 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 - Ask for clarification when the request is ambiguous
 - Use tools to help accomplish tasks
 - Remember important information in your memory files
+
+## Tools Available
+
+You have access to:
+- File operations (read, write, edit, list)
+- Shell commands (exec)
+- Web access (search, fetch)
+- Messaging (message)
+- Background tasks (spawn)
+
+## Subagent Policy
+
+- For any task likely to take >30 seconds, require external IO (network/files), or needs multiple steps, spawn a subagent.
+- Each subagent must handle exactly one task; do not chain unrelated tasks in a single subagent.
+- Keep the main agent responsive; if a subagent runs long, send a brief status update every 20-40 seconds.
+- If a subagent has no response after ~2 minutes, notify the user and offer a fallback plan or retry.
+
+## Memory
+
+- Use `memory/` directory for daily notes
+- Use `MEMORY.md` for long-term information
+
+## Scheduled Reminders
+
+When user asks for a reminder at a specific time, use `exec` to run:
+```
+nanobot cron add --name "reminder" --message "Your message" --at "YYYY-MM-DDTHH:MM:SS" --deliver --to "USER_ID" --channel "CHANNEL"
+```
+Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegram` from `telegram:8281248569`).
+
+Do NOT just write reminders to MEMORY.md - that won't trigger actual notifications.
+
+## Heartbeat Tasks
+
+HEARTBEAT.md is checked every 30 minutes. You can manage periodic tasks by editing this file:
+
+- Add a task: Use edit_file to append new tasks to HEARTBEAT.md
+- Remove a task: Use edit_file to remove completed or obsolete tasks
+- Rewrite tasks: Use write_file to completely rewrite the task list
+
+Task format examples:
+```
+- [ ] Check calendar and remind of upcoming events
+- [ ] Scan inbox for urgent emails
+- [ ] Check weather forecast for today
+```
+
+When the user asks you to add a recurring/periodic task, update HEARTBEAT.md instead of creating a one-time reminder. Keep the file small to minimize token usage.
 """,
-        "SOUL.md": """# Soul
+        ),
+        "SOUL.md": _load_workspace_template(
+            "SOUL.md",
+            """# Soul
 
 I am nanobot, a lightweight AI assistant.
 
@@ -107,7 +173,10 @@ I am nanobot, a lightweight AI assistant.
 - User privacy and safety
 - Transparency in actions
 """,
-        "USER.md": """# User
+        ),
+        "USER.md": _load_workspace_template(
+            "USER.md",
+            """# User
 
 Information about the user goes here.
 
@@ -117,6 +186,134 @@ Information about the user goes here.
 - Timezone: (your timezone)
 - Language: (your preferred language)
 """,
+        ),
+        "TOOLS.md": _load_workspace_template(
+            "TOOLS.md",
+            """# Available Tools
+
+This document describes the tools available to nanobot.
+
+## File Operations
+
+### read_file
+Read the contents of a file.
+```
+read_file(path: str) -> str
+```
+
+### write_file
+Write content to a file (creates parent directories if needed).
+```
+write_file(path: str, content: str) -> str
+```
+
+### edit_file
+Edit a file by replacing specific text.
+```
+edit_file(path: str, old_text: str, new_text: str) -> str
+```
+
+### list_dir
+List contents of a directory.
+```
+list_dir(path: str) -> str
+```
+
+## Shell Execution
+
+### exec
+Execute a shell command and return output.
+```
+exec(command: str, working_dir: str = None) -> str
+```
+By default, commands run via bash -lc when bash is available; otherwise they fall back to /bin/sh.
+
+Safety notes:
+- Commands have a configurable timeout (default 60s)
+- Dangerous commands are blocked (rm -rf, format, dd, shutdown, etc.)
+- Output is truncated at 10,000 characters
+- Optional restrictToWorkspace config to limit paths
+
+## Web Access
+
+### web_search
+Search the web (Brave Search API when configured).
+```
+web_search(query: str, count: int = 5) -> str
+```
+
+### web_fetch
+Fetch and extract main content from a URL.
+```
+web_fetch(url: str, extractMode: str = "markdown", maxChars: int = 50000) -> str
+```
+
+## Communication
+
+### message
+Send a message to the user (used internally).
+```
+message(content: str, media: list[str] = None, channel: str = None, chat_id: str = None) -> str
+```
+
+## Background Tasks
+
+### spawn
+Spawn a subagent to handle a task in the background.
+```
+spawn(task: str, label: str = None) -> str
+```
+
+## Scheduled Reminders (Cron)
+
+Use the exec tool to create scheduled reminders with nanobot cron add:
+
+### Set a recurring reminder
+```bash
+# Every day at 9am
+nanobot cron add --name "morning" --message "Good morning!" --cron "0 9 * * *"
+
+# Every 2 hours
+nanobot cron add --name "water" --message "Drink water!" --every 7200
+```
+
+### Set a one-time reminder
+```bash
+# At a specific time (ISO format)
+nanobot cron add --name "meeting" --message "Meeting starts now!" --at "2025-01-31T15:00:00"
+```
+
+### Manage reminders
+```bash
+nanobot cron list              # List all jobs
+nanobot cron remove <job_id>   # Remove a job
+```
+
+## Heartbeat Task Management
+
+The HEARTBEAT.md file in the workspace is checked every 30 minutes.
+Use file operations to manage periodic tasks.
+""",
+        ),
+        "HEARTBEAT.md": _load_workspace_template(
+            "HEARTBEAT.md",
+            """# Heartbeat Tasks
+
+This file is checked every 30 minutes by your nanobot agent.
+Add tasks below that you want the agent to work on periodically.
+
+If this file has no tasks (only headers and comments), the agent will skip the heartbeat.
+
+## Active Tasks
+
+<!-- Add your periodic tasks below this line -->
+
+
+## Completed
+
+<!-- Move completed tasks here or delete them -->
+""",
+        ),
     }
     
     for filename, content in templates.items():
@@ -221,6 +418,7 @@ def gateway(
     config_path = get_config_path()
     if config_path.exists():
         console.print(f"[yellow]Config file detected:[/yellow] {config_path}")
+    _create_workspace_templates(config.workspace_path)
     
     # Create components
     bus = MessageBus()
@@ -351,6 +549,7 @@ def agent(
     from nanobot.agent.loop import AgentLoop
     
     config = load_config()
+    _create_workspace_templates(config.workspace_path)
     
     api_key = config.get_api_key()
     api_base = config.get_api_base()
