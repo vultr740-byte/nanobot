@@ -3,11 +3,15 @@
 import asyncio
 import mimetypes
 import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from loguru import logger
-from telegram import Update, InputFile
+from telegram import Update, InputFile, Message, User
+from telegram.constants import ChatAction
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 from nanobot.bus.events import OutboundMessage
@@ -79,6 +83,17 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
+@dataclass
+class _PendingTextEntry:
+    sender_id: str
+    chat_id: int
+    texts: list[str]
+    metadata: dict[str, Any]
+    last_message_id: int | None
+    last_received_at: float
+    timer: asyncio.Task | None = None
+
+
 class TelegramChannel(BaseChannel):
     """
     Telegram channel using long polling.
@@ -94,6 +109,16 @@ class TelegramChannel(BaseChannel):
         self.groq_api_key = groq_api_key
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
+        self._pending_lock = asyncio.Lock()
+        self._debounce_entries: dict[str, _PendingTextEntry] = {}
+        self._text_fragment_entries: dict[str, _PendingTextEntry] = {}
+        # Debounce settings (ms) and text fragment stitching (OpenClaw-style defaults).
+        self._debounce_ms = int(getattr(config, "debounce_ms", 600))
+        self._text_fragment_start_threshold = int(getattr(config, "text_fragment_start_threshold", 4000))
+        self._text_fragment_max_gap_ms = int(getattr(config, "text_fragment_max_gap_ms", 1500))
+        self._text_fragment_max_id_gap = int(getattr(config, "text_fragment_max_id_gap", 1))
+        self._text_fragment_max_parts = int(getattr(config, "text_fragment_max_parts", 12))
+        self._text_fragment_max_total_chars = int(getattr(config, "text_fragment_max_total_chars", 50_000))
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -222,10 +247,158 @@ class TelegramChannel(BaseChannel):
         if lower.endswith((".mp3", ".m4a", ".wav", ".flac", ".aac")):
             return "audio"
         return "document"
+
+    @staticmethod
+    def _pending_key(chat_id: int, sender_id: str) -> str:
+        return f"{chat_id}:{sender_id}"
+
+    @staticmethod
+    def _is_command_text(text: str) -> bool:
+        return text.lstrip().startswith("/")
+
+    @staticmethod
+    def _build_metadata(message: Message | None, user: User | None) -> dict[str, Any]:
+        if not message or not user:
+            return {}
+        return {
+            "message_id": message.message_id,
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "is_group": message.chat.type != "private",
+        }
+
+    async def _send_typing(self, chat_id: int) -> None:
+        if not self._app:
+            return
+        try:
+            await self._app.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except Exception as e:
+            logger.debug(f"Failed to send typing action: {e}")
+
+    async def _emit_text_entry(self, entry: _PendingTextEntry, joiner: str) -> None:
+        content = joiner.join(entry.texts).strip()
+        if not content:
+            return
+        await self._send_typing(entry.chat_id)
+        await self._handle_message(
+            sender_id=entry.sender_id,
+            chat_id=str(entry.chat_id),
+            content=content,
+            media=[],
+            metadata=entry.metadata,
+        )
+
+    async def _schedule_debounce_flush(self, key: str, entry: _PendingTextEntry) -> None:
+        try:
+            await asyncio.sleep(self._debounce_ms / 1000)
+        except asyncio.CancelledError:
+            return
+        async with self._pending_lock:
+            current = self._debounce_entries.get(key)
+            if current is not entry:
+                return
+            self._debounce_entries.pop(key, None)
+        await self._emit_text_entry(entry, "\n")
+
+    async def _schedule_text_fragment_flush(self, key: str, entry: _PendingTextEntry) -> None:
+        try:
+            await asyncio.sleep(self._text_fragment_max_gap_ms / 1000)
+        except asyncio.CancelledError:
+            return
+        async with self._pending_lock:
+            current = self._text_fragment_entries.get(key)
+            if current is not entry:
+                return
+            self._text_fragment_entries.pop(key, None)
+        await self._emit_text_entry(entry, "")
+
+    async def _enqueue_debounced_text(self, key: str, entry: _PendingTextEntry, text: str) -> None:
+        async with self._pending_lock:
+            existing = self._debounce_entries.get(key)
+            if existing:
+                existing.texts.append(text)
+                existing.metadata = entry.metadata
+                existing.last_message_id = entry.last_message_id
+                existing.last_received_at = entry.last_received_at
+                if existing.timer:
+                    existing.timer.cancel()
+                existing.timer = asyncio.create_task(self._schedule_debounce_flush(key, existing))
+                return
+            entry.texts = [text]
+            entry.timer = asyncio.create_task(self._schedule_debounce_flush(key, entry))
+            self._debounce_entries[key] = entry
+
+    async def _enqueue_text_fragment(self, key: str, entry: _PendingTextEntry, text: str) -> None:
+        to_flush: _PendingTextEntry | None = None
+        async with self._pending_lock:
+            existing = self._text_fragment_entries.get(key)
+            if existing:
+                id_gap = (entry.last_message_id or 0) - (existing.last_message_id or 0)
+                time_gap = entry.last_received_at - existing.last_received_at
+                can_append = (
+                    id_gap > 0
+                    and id_gap <= self._text_fragment_max_id_gap
+                    and time_gap >= 0
+                    and time_gap <= (self._text_fragment_max_gap_ms / 1000)
+                )
+                total_chars = sum(len(t) for t in existing.texts) + len(text)
+                if (
+                    can_append
+                    and len(existing.texts) + 1 <= self._text_fragment_max_parts
+                    and total_chars <= self._text_fragment_max_total_chars
+                ):
+                    existing.texts.append(text)
+                    existing.metadata = entry.metadata
+                    existing.last_message_id = entry.last_message_id
+                    existing.last_received_at = entry.last_received_at
+                    if existing.timer:
+                        existing.timer.cancel()
+                    existing.timer = asyncio.create_task(
+                        self._schedule_text_fragment_flush(key, existing)
+                    )
+                    return
+                # Flush existing if we can't append this fragment
+                if existing.timer:
+                    existing.timer.cancel()
+                self._text_fragment_entries.pop(key, None)
+                to_flush = existing
+
+            entry.texts = [text]
+            entry.timer = asyncio.create_task(self._schedule_text_fragment_flush(key, entry))
+            self._text_fragment_entries[key] = entry
+
+        if to_flush:
+            await self._emit_text_entry(to_flush, "")
+
+    async def _flush_pending_for_key(self, key: str) -> None:
+        debounce_entry: _PendingTextEntry | None = None
+        fragment_entry: _PendingTextEntry | None = None
+        async with self._pending_lock:
+            debounce_entry = self._debounce_entries.pop(key, None)
+            fragment_entry = self._text_fragment_entries.pop(key, None)
+            if debounce_entry and debounce_entry.timer:
+                debounce_entry.timer.cancel()
+            if fragment_entry and fragment_entry.timer:
+                fragment_entry.timer.cancel()
+        if fragment_entry:
+            await self._emit_text_entry(fragment_entry, "")
+        if debounce_entry:
+            await self._emit_text_entry(debounce_entry, "\n")
     
     async def stop(self) -> None:
         """Stop the Telegram bot."""
         self._running = False
+
+        pending: list[_PendingTextEntry] = []
+        async with self._pending_lock:
+            pending.extend(self._debounce_entries.values())
+            pending.extend(self._text_fragment_entries.values())
+            self._debounce_entries.clear()
+            self._text_fragment_entries.clear()
+        for entry in pending:
+            if entry.timer:
+                entry.timer.cancel()
         
         if self._app:
             logger.info("Stopping Telegram bot...")
@@ -329,6 +502,32 @@ class TelegramChannel(BaseChannel):
         
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
+
+        text_content = message.text or message.caption or ""
+        has_media = bool(message.photo or message.voice or message.audio or message.document)
+        is_command = bool(message.text and self._is_command_text(message.text))
+        key = self._pending_key(chat_id, sender_id)
+        metadata = self._build_metadata(message, user)
+
+        # Debounce and merge text-only messages (skip commands).
+        if text_content and not has_media and not is_command:
+            entry = _PendingTextEntry(
+                sender_id=sender_id,
+                chat_id=chat_id,
+                texts=[text_content],
+                metadata=metadata,
+                last_message_id=message.message_id,
+                last_received_at=time.monotonic(),
+            )
+            if len(text_content) >= self._text_fragment_start_threshold:
+                await self._enqueue_text_fragment(key, entry, text_content)
+            else:
+                await self._enqueue_debounced_text(key, entry, text_content)
+            return
+
+        # Flush any pending text before handling media/commands to preserve ordering.
+        await self._flush_pending_for_key(key)
+        await self._send_typing(chat_id)
         
         # Build content from text and/or media
         content_parts = []
@@ -393,17 +592,6 @@ class TelegramChannel(BaseChannel):
         content = "\n".join(content_parts) if content_parts else "[empty message]"
         
         logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
-
-        thinking_message_id = None
-        try:
-            thinking_html = _markdown_to_telegram_html("🧑‍💻 思考中…")
-            thinking_msg = await message.reply_text(
-                thinking_html,
-                parse_mode="HTML"
-            )
-            thinking_message_id = thinking_msg.message_id
-        except Exception as e:
-            logger.warning(f"Failed to send thinking message: {e}")
         
         # Forward to the message bus
         await self._handle_message(
@@ -411,14 +599,7 @@ class TelegramChannel(BaseChannel):
             chat_id=str(chat_id),
             content=content,
             media=media_paths,
-            metadata={
-                "message_id": message.message_id,
-                "user_id": user.id,
-                "username": user.username,
-                "first_name": user.first_name,
-                "is_group": message.chat.type != "private",
-                "thinking_message_id": thinking_message_id,
-            }
+            metadata=metadata,
         )
     
     def _get_extension(self, media_type: str, mime_type: str | None) -> str:
