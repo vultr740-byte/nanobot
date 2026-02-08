@@ -18,6 +18,13 @@ You have access to:
 - Messaging (message)
 - Background tasks (spawn)
 
+## Subagent Policy
+
+- For any task likely to take >30 seconds, require external IO (network/files), or needs multiple steps, spawn a subagent.
+- Each subagent must handle exactly one task; do not chain unrelated tasks in a single subagent.
+- Keep the main agent responsive; if a subagent runs long, send a brief status update every 20-40 seconds.
+- If a subagent has no response after ~2 minutes, notify the user and offer a fallback plan or retry.
+
 ## Memory
 
 - Use `memory/` directory for daily notes
