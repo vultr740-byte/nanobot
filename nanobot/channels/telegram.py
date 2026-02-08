@@ -98,6 +98,8 @@ class _PendingTextEntry:
 class _PendingFeedback:
     chat_id: int
     message_id: int | None
+    emoji: str
+    sent: bool = False
     timer: asyncio.Task | None = None
 
 
@@ -130,6 +132,8 @@ class TelegramChannel(BaseChannel):
         self._text_fragment_max_total_chars = int(getattr(config, "text_fragment_max_total_chars", 50_000))
         # Typing feedback reaction settings.
         self._typing_feedback_delay_s = float(getattr(config, "typing_feedback_delay_s", 6.0))
+        self._typing_window_s = float(getattr(config, "typing_window_s", 5.0))
+        self._typing_feedback_grace_s = float(getattr(config, "typing_feedback_grace_s", 1.0))
         self._typing_feedback_emoji = getattr(config, "typing_feedback_emoji", "") or "👀"
     
     async def start(self) -> None:
@@ -300,12 +304,17 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.debug(f"Failed to set reaction: {e}")
 
-    async def _schedule_feedback_reaction(self, chat_id: int, message_id: int | None) -> None:
+    async def _schedule_feedback_reaction(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        emoji: str,
+    ) -> None:
         if not message_id:
             return
-        if self._typing_feedback_delay_s <= 0:
+        if self._typing_feedback_delay_s <= 0 and self._typing_feedback_grace_s <= 0:
             return
-        entry = _PendingFeedback(chat_id=chat_id, message_id=message_id)
+        entry = _PendingFeedback(chat_id=chat_id, message_id=message_id, emoji=emoji)
         async with self._feedback_lock:
             existing = self._pending_feedback.get(chat_id)
             if existing and existing.timer:
@@ -314,17 +323,23 @@ class TelegramChannel(BaseChannel):
             self._pending_feedback[chat_id] = entry
 
     async def _feedback_after_delay(self, chat_id: int, entry: _PendingFeedback) -> None:
+        delay_s = self._typing_feedback_delay_s
+        min_delay = self._typing_window_s + self._typing_feedback_grace_s
+        if delay_s < min_delay:
+            delay_s = min_delay
         try:
-            await asyncio.sleep(self._typing_feedback_delay_s)
+            await asyncio.sleep(delay_s)
         except asyncio.CancelledError:
             return
         async with self._feedback_lock:
             current = self._pending_feedback.get(chat_id)
             if current is not entry:
                 return
-            self._pending_feedback.pop(chat_id, None)
+            entry.timer = None
+            entry.sent = True
+            emoji = entry.emoji
         if entry.message_id:
-            await self._send_reaction(chat_id, entry.message_id, self._typing_feedback_emoji)
+            await self._send_reaction(chat_id, entry.message_id, emoji)
 
     async def _cancel_feedback(self, chat_id: int) -> None:
         async with self._feedback_lock:
@@ -332,12 +347,80 @@ class TelegramChannel(BaseChannel):
             if entry and entry.timer:
                 entry.timer.cancel()
 
+    async def _update_feedback_emoji(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        emoji: str,
+    ) -> None:
+        if not message_id:
+            return
+        send_now = False
+        async with self._feedback_lock:
+            entry = self._pending_feedback.get(chat_id)
+            if not entry or entry.message_id != message_id:
+                return
+            entry.emoji = emoji
+            send_now = entry.sent
+        if send_now:
+            await self._send_reaction(chat_id, message_id, emoji)
+
+    @staticmethod
+    def _pick_from_pool(pool: list[str], seed: int | None) -> str:
+        if not pool:
+            return ""
+        if seed is None:
+            import random
+            return random.choice(pool)
+        return pool[abs(int(seed)) % len(pool)]
+
+    def _pick_text_feedback_emoji(
+        self,
+        content: str,
+        has_media: bool = False,
+        is_command: bool = False,
+        seed: int | None = None,
+    ) -> str:
+        if has_media:
+            return self._pick_from_pool(["📎", "📁", "📄"], seed)
+        if is_command:
+            return self._pick_from_pool(["🛠️", "🔧", "🧪"], seed)
+        lower = content.lower()
+        if any(k in lower for k in ("http://", "https://", "search", "news", "查", "搜索", "资料", "链接", "url")):
+            return self._pick_from_pool(["🔍", "🧭"], seed)
+        if any(k in lower for k in ("error", "bug", "build", "compile", "deploy", "报错", "日志", "编译", "部署")):
+            return self._pick_from_pool(["🛠️", "🔧", "🧪"], seed)
+        if any(k in lower for k in ("file", "upload", "download", "附件", "文件", "上传", "下载")):
+            return self._pick_from_pool(["📎", "📁", "📄"], seed)
+        if any(k in lower for k in ("summary", "summarize", "总结", "梳理", "概览")):
+            return self._pick_from_pool(["🧾", "🗂️"], seed)
+        if any(k in lower for k in ("translate", "translation", "翻译")):
+            return self._pick_from_pool(["🌐", "🗺️"], seed)
+        if any(k in lower for k in ("cron", "schedule", "remind", "提醒", "定时")):
+            return self._pick_from_pool(["⏰", "🗓️"], seed)
+        return self._pick_from_pool([self._typing_feedback_emoji, "👀", "⏳", "🧠"], seed)
+
+    def _pick_tool_feedback_emoji(self, tool_name: str, seed: int | None = None) -> str:
+        key = tool_name.lower()
+        if key in ("web_search", "web_fetch", "search", "fetch"):
+            return self._pick_from_pool(["🔍", "🧭"], seed)
+        if key in ("exec", "shell", "command"):
+            return self._pick_from_pool(["🛠️", "🔧", "🧪"], seed)
+        if key in ("read_file", "write_file", "edit_file", "list_dir", "filesystem"):
+            return self._pick_from_pool(["📄", "📁"], seed)
+        if key in ("spawn", "subagent"):
+            return self._pick_from_pool(["🧩", "🧠"], seed)
+        if key in ("message", "send"):
+            return self._pick_from_pool(["💬", "✉️"], seed)
+        return self._pick_from_pool([self._typing_feedback_emoji, "👀"], seed)
+
     async def _emit_text_entry(self, entry: _PendingTextEntry, joiner: str) -> None:
         content = joiner.join(entry.texts).strip()
         if not content:
             return
         await self._send_typing(entry.chat_id)
-        await self._schedule_feedback_reaction(entry.chat_id, entry.last_message_id)
+        emoji = self._pick_text_feedback_emoji(content, seed=entry.last_message_id)
+        await self._schedule_feedback_reaction(entry.chat_id, entry.last_message_id, emoji)
         await self._handle_message(
             sender_id=entry.sender_id,
             chat_id=str(entry.chat_id),
@@ -482,7 +565,28 @@ class TelegramChannel(BaseChannel):
             logger.error(f"Invalid chat_id: {msg.chat_id}")
             return
 
-        await self._cancel_feedback(chat_id)
+        reaction_message_id = None
+        reaction_emoji = None
+        reaction_hint = None
+        reaction_only = False
+        if msg.metadata:
+            reaction_message_id = msg.metadata.get("reaction_message_id")
+            reaction_emoji = msg.metadata.get("reaction_emoji")
+            reaction_hint = msg.metadata.get("reaction_hint")
+            reaction_only = bool(msg.metadata.get("reaction_only"))
+
+        if reaction_message_id and (reaction_emoji or reaction_hint):
+            emoji = reaction_emoji or self._pick_tool_feedback_emoji(
+                str(reaction_hint),
+                seed=int(reaction_message_id),
+            )
+            if emoji:
+                await self._update_feedback_emoji(chat_id, int(reaction_message_id), emoji)
+            if reaction_only and not msg.content and not msg.media:
+                return
+
+        if msg.content or msg.media:
+            await self._cancel_feedback(chat_id)
 
         # 1) Send text content as a separate message (or edit if requested).
         if msg.content:
@@ -592,7 +696,13 @@ class TelegramChannel(BaseChannel):
         # Flush any pending text before handling media/commands to preserve ordering.
         await self._flush_pending_for_key(key)
         await self._send_typing(chat_id)
-        await self._schedule_feedback_reaction(chat_id, message.message_id)
+        emoji = self._pick_text_feedback_emoji(
+            text_content,
+            has_media=has_media,
+            is_command=is_command,
+            seed=message.message_id,
+        )
+        await self._schedule_feedback_reaction(chat_id, message.message_id, emoji)
         
         # Build content from text and/or media
         content_parts = []

@@ -19,6 +19,8 @@ class TelegramConfig(BaseModel):
     token: str = ""  # Bot token from @BotFather
     allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
     typing_feedback_delay_s: float = 6.0
+    typing_window_s: float = 5.0
+    typing_feedback_grace_s: float = 1.0
     typing_feedback_emoji: str = ""
 
 

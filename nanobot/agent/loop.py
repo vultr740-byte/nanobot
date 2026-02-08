@@ -131,6 +131,28 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    @staticmethod
+    def _pick_reaction_tool_hint(tool_calls: list[Any]) -> str | None:
+        """Pick a primary tool name for reaction hinting."""
+        priority = [
+            "web_search",
+            "web_fetch",
+            "exec",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "spawn",
+            "message",
+        ]
+        names = [getattr(tc, "name", "") for tc in tool_calls if getattr(tc, "name", None)]
+        if not names:
+            return None
+        for key in priority:
+            if key in names:
+                return key
+        return names[0]
     
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
@@ -171,6 +193,8 @@ class AgentLoop:
         # Agent loop
         iteration = 0
         final_content = None
+        reaction_message_id = msg.metadata.get("message_id") if msg.metadata else None
+        reaction_hint_sent = False
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -184,6 +208,24 @@ class AgentLoop:
             
             # Handle tool calls
             if response.has_tool_calls:
+                if (
+                    not reaction_hint_sent
+                    and msg.channel == "telegram"
+                    and reaction_message_id
+                ):
+                    tool_hint = self._pick_reaction_tool_hint(response.tool_calls)
+                    if tool_hint:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="",
+                            metadata={
+                                "reaction_message_id": reaction_message_id,
+                                "reaction_hint": tool_hint,
+                                "reaction_only": True,
+                            },
+                        ))
+                        reaction_hint_sent = True
                 tool_names = ", ".join(tc.name for tc in response.tool_calls)
                 logger.info(f"Tool calls requested: {tool_names}")
                 # Add assistant message with tool calls
