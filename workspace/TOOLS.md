@@ -35,6 +35,7 @@ Execute a shell command and return output.
 ```
 exec(command: str, working_dir: str = None) -> str
 ```
+By default, commands run via `bash -lc` when bash is available; otherwise they fall back to `/bin/sh`.
 
 **Safety Notes:**
 - Commands have a configurable timeout (default 60s)

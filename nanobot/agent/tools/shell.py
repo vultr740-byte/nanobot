@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,8 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
+        self._bash_path: str | None = None
+        self._bash_checked = False
     
     @property
     def name(self) -> str:
@@ -67,12 +70,23 @@ class ExecTool(Tool):
             return guard_error
         
         try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-            )
+            bash_path = self._get_bash_path()
+            if bash_path:
+                process = await asyncio.create_subprocess_exec(
+                    bash_path,
+                    "-lc",
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                )
+            else:
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                )
             
             try:
                 stdout, stderr = await asyncio.wait_for(
@@ -107,6 +121,21 @@ class ExecTool(Tool):
             
         except Exception as e:
             return f"Error executing command: {str(e)}"
+
+    def _get_bash_path(self) -> str | None:
+        """Resolve bash path once; return None if unavailable."""
+        if self._bash_checked:
+            return self._bash_path
+        self._bash_checked = True
+        if os.name == "nt":
+            return None
+        candidates = ["/bin/bash", "/usr/bin/bash"]
+        for candidate in candidates:
+            if Path(candidate).exists():
+                self._bash_path = candidate
+                return self._bash_path
+        self._bash_path = shutil.which("bash")
+        return self._bash_path
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
