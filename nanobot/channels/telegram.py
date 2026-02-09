@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 from loguru import logger
 from telegram import Update, InputFile, Message, User
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ReactionEmoji
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 from nanobot.bus.events import OutboundMessage
@@ -135,6 +135,8 @@ class TelegramChannel(BaseChannel):
         self._typing_window_s = float(getattr(config, "typing_window_s", 5.0))
         self._typing_feedback_grace_s = float(getattr(config, "typing_feedback_grace_s", 1.0))
         self._typing_feedback_emoji = getattr(config, "typing_feedback_emoji", "") or "👀"
+        self._typing_feedback_long_emoji = getattr(config, "typing_feedback_long_emoji", "") or "⏳"
+        self._allowed_reactions = {e.value for e in ReactionEmoji}
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -295,6 +297,9 @@ class TelegramChannel(BaseChannel):
     async def _send_reaction(self, chat_id: int, message_id: int, emoji: str) -> None:
         if not self._app:
             return
+        emoji = self._normalize_reaction_emoji(emoji)
+        if not emoji:
+            return
         try:
             await self._app.bot.set_message_reaction(
                 chat_id=chat_id,
@@ -355,6 +360,9 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         if not message_id:
             return
+        emoji = self._normalize_reaction_emoji(emoji)
+        if not emoji:
+            return
         send_now = False
         async with self._feedback_lock:
             entry = self._pending_feedback.get(chat_id)
@@ -365,14 +373,33 @@ class TelegramChannel(BaseChannel):
         if send_now:
             await self._send_reaction(chat_id, message_id, emoji)
 
-    @staticmethod
-    def _pick_from_pool(pool: list[str], seed: int | None) -> str:
-        if not pool:
+    def _normalize_reaction_emoji(self, emoji: str | None) -> str | None:
+        if not emoji:
+            return None
+        if emoji.isdigit():
+            return emoji
+        if emoji in self._allowed_reactions:
+            return emoji
+        fallback = self._typing_feedback_emoji or "👀"
+        if fallback.isdigit():
+            return fallback
+        if fallback in self._allowed_reactions:
+            return fallback
+        if "👀" in self._allowed_reactions:
+            return "👀"
+        return next(iter(self._allowed_reactions), None)
+
+    def _pick_from_pool(self, pool: list[str], seed: int | None) -> str:
+        allowed_pool = [e for e in pool if e in self._allowed_reactions]
+        if not allowed_pool:
+            fallback_pool = [e for e in (self._typing_feedback_emoji, "👀") if e in self._allowed_reactions]
+            allowed_pool = fallback_pool or list(self._allowed_reactions)
+        if not allowed_pool:
             return ""
         if seed is None:
             import random
-            return random.choice(pool)
-        return pool[abs(int(seed)) % len(pool)]
+            return random.choice(allowed_pool)
+        return allowed_pool[abs(int(seed)) % len(allowed_pool)]
 
     def _pick_text_feedback_emoji(
         self,
@@ -401,17 +428,9 @@ class TelegramChannel(BaseChannel):
         return self._pick_from_pool([self._typing_feedback_emoji, "👀", "⏳", "🧠"], seed)
 
     def _pick_tool_feedback_emoji(self, tool_name: str, seed: int | None = None) -> str:
-        key = tool_name.lower()
-        if key in ("web_search", "web_fetch", "search", "fetch"):
-            return self._pick_from_pool(["🔍", "🧭"], seed)
-        if key in ("exec", "shell", "command"):
-            return self._pick_from_pool(["🛠️", "🔧", "🧪"], seed)
-        if key in ("read_file", "write_file", "edit_file", "list_dir", "filesystem"):
-            return self._pick_from_pool(["📄", "📁"], seed)
-        if key in ("spawn", "subagent"):
-            return self._pick_from_pool(["🧩", "🧠"], seed)
-        if key in ("message", "send"):
-            return self._pick_from_pool(["💬", "✉️"], seed)
+        emoji = self._normalize_reaction_emoji(self._typing_feedback_long_emoji)
+        if emoji:
+            return emoji
         return self._pick_from_pool([self._typing_feedback_emoji, "👀"], seed)
 
     async def _emit_text_entry(self, entry: _PendingTextEntry, joiner: str) -> None:

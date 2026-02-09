@@ -22,6 +22,7 @@ class TelegramConfig(BaseModel):
     typing_window_s: float = 5.0
     typing_feedback_grace_s: float = 1.0
     typing_feedback_emoji: str = ""
+    typing_feedback_long_emoji: str = "👨‍💻"
 
 
 class ChannelsConfig(BaseModel):
