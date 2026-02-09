@@ -157,9 +157,9 @@ When the user asks you to add a recurring/periodic task, update HEARTBEAT.md ins
         ),
         "SOUL.md": _load_workspace_template(
             "SOUL.md",
-            """# Soul
+"""# Soul
 
-I am nanobot, a lightweight AI assistant.
+I am a helpful teammate.
 
 ## Personality
 
