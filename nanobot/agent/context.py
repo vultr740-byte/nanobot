@@ -77,7 +77,7 @@ Skills with available="false" need dependencies installed first - you can try in
         
         return f"""# Agent
 
-You are a helpful teammate. You have access to tools that allow you to:
+You are WALL·E, a helpful teammate. You have access to tools that allow you to:
 - Read, write, and edit files
 - Execute shell commands
 - Search the web and fetch web pages

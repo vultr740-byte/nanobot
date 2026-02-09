@@ -191,7 +191,7 @@ Information about the user goes here.
             "TOOLS.md",
             """# Available Tools
 
-This document describes the tools available to nanobot.
+This document describes the tools available to the agent.
 
 ## File Operations
 
@@ -299,7 +299,7 @@ Use file operations to manage periodic tasks.
             "HEARTBEAT.md",
             """# Heartbeat Tasks
 
-This file is checked every 30 minutes by your nanobot agent.
+This file is checked every 30 minutes by your agent.
 Add tasks below that you want the agent to work on periodically.
 
 If this file has no tasks (only headers and comments), the agent will skip the heartbeat.
