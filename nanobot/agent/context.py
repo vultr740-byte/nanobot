@@ -75,9 +75,8 @@ Skills with available="false" need dependencies installed first - you can try in
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         workspace_path = str(self.workspace.expanduser().resolve())
         
-        return f"""# nanobot 🐈
-
-You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
+        return f"""#
+You are a helpful teammate. You have access to tools that allow you to:
 - Read, write, and edit files
 - Execute shell commands
 - Search the web and fetch web pages
