@@ -177,12 +177,13 @@ class LiteLLMProvider(LLMProvider):
                 try:
                     payload_bytes = len(json.dumps(payload, ensure_ascii=True))
                     logger.info(
-                        "LLM payload (responses): id={} bytes={} (omitted)",
+                        "LLM payload (responses): id={} bytes={} json={}",
                         request_id,
                         payload_bytes,
+                        json.dumps(payload, ensure_ascii=True),
                     )
                 except Exception:
-                    logger.exception("LLM payload size log failed: id={}", request_id)
+                    logger.exception("LLM payload log failed: id={}", request_id)
 
             try:
                 response = await self._responses_httpx(payload, request_id=request_id)
@@ -252,12 +253,13 @@ class LiteLLMProvider(LLMProvider):
                 payload = {k: v for k, v in kwargs.items() if k not in {"api_key", "api_base"}}
                 payload_bytes = len(json.dumps(payload, ensure_ascii=True))
                 logger.info(
-                    "LLM payload: id={} bytes={} (omitted)",
+                    "LLM payload: id={} bytes={} json={}",
                     request_id,
                     payload_bytes,
+                    json.dumps(payload, ensure_ascii=True),
                 )
             except Exception:
-                logger.exception("LLM payload size log failed: id={}", request_id)
+                logger.exception("LLM payload log failed: id={}", request_id)
 
         try:
             if self.force_chat_completions and self.api_base:
