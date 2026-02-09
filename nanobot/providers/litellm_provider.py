@@ -176,18 +176,13 @@ class LiteLLMProvider(LLMProvider):
                 )
                 try:
                     payload_bytes = len(json.dumps(payload, ensure_ascii=True))
-                    redacted_payload = self._redact_payload(payload)
-                    redacted_json = json.dumps(redacted_payload, ensure_ascii=True)
-                    if len(redacted_json) > 4000:
-                        redacted_json = f"{redacted_json[:4000]}...(truncated)"
                     logger.info(
-                        "LLM payload (responses): id={} bytes={} json={}",
+                        "LLM payload (responses): id={} bytes={} (omitted)",
                         request_id,
                         payload_bytes,
-                        redacted_json,
                     )
                 except Exception:
-                    logger.exception("LLM payload log failed: id={}", request_id)
+                    logger.exception("LLM payload size log failed: id={}", request_id)
 
             try:
                 response = await self._responses_httpx(payload, request_id=request_id)
@@ -256,18 +251,13 @@ class LiteLLMProvider(LLMProvider):
             try:
                 payload = {k: v for k, v in kwargs.items() if k not in {"api_key", "api_base"}}
                 payload_bytes = len(json.dumps(payload, ensure_ascii=True))
-                redacted_payload = self._redact_payload(payload)
-                redacted_json = json.dumps(redacted_payload, ensure_ascii=True)
-                if len(redacted_json) > 4000:
-                    redacted_json = f"{redacted_json[:4000]}...(truncated)"
                 logger.info(
-                    "LLM payload: id={} bytes={} json={}",
+                    "LLM payload: id={} bytes={} (omitted)",
                     request_id,
                     payload_bytes,
-                    redacted_json,
                 )
             except Exception:
-                logger.exception("LLM payload log failed: id={}", request_id)
+                logger.exception("LLM payload size log failed: id={}", request_id)
 
         try:
             if self.force_chat_completions and self.api_base:
