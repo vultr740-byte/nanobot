@@ -96,7 +96,7 @@ pip install nanobot-ai
 nanobot onboard
 ```
 
-**2. Configure** (`~/.nanobot/config.json`)
+**2. Configure** (default `~/.nanobot/config.json`)
 
 ```json
 {
@@ -140,7 +140,7 @@ Run nanobot with your own local models using vLLM or any OpenAI-compatible serve
 vllm serve meta-llama/Llama-3.1-8B-Instruct --port 8000
 ```
 
-**2. Configure** (`~/.nanobot/config.json`)
+**2. Configure** (default `~/.nanobot/config.json`)
 
 ```json
 {
@@ -336,7 +336,7 @@ nanobot cron remove <job_id>
 ## 🐳 Docker
 
 > [!TIP]
-> The `-v ~/.nanobot:/root/.nanobot` flag mounts your local config directory into the container, so your config and workspace persist across container restarts.
+> The `-v ~/.nanobot:/root/.nanobot` flag mounts your local data directory into the container, so your config and workspace persist across container restarts.
 
 Build and run nanobot in a container:
 

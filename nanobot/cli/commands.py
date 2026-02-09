@@ -8,6 +8,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.table import Table
+from loguru import logger
 
 from nanobot import __version__, __logo__
 
@@ -18,6 +19,7 @@ app = typer.Typer(
 )
 
 console = Console()
+_FILE_LOGGING_READY = False
 
 
 def version_callback(value: bool):
@@ -69,7 +71,7 @@ def onboard():
     
     console.print(f"\n{__logo__} nanobot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
+    console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
@@ -87,6 +89,17 @@ def _load_workspace_template(filename: str, fallback: str) -> str:
         except Exception:
             pass
     return fallback
+
+
+def _setup_file_logging() -> None:
+    global _FILE_LOGGING_READY
+    if _FILE_LOGGING_READY:
+        return
+    from nanobot.utils.helpers import get_data_path
+    log_dir = get_data_path() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger.add(str(log_dir / "nanobot.log"), rotation="00:00", retention="1 day", level="INFO")
+    _FILE_LOGGING_READY = True
 
 
 def _create_workspace_templates(workspace: Path):
@@ -412,6 +425,7 @@ def gateway(
         import logging
         logging.basicConfig(level=logging.DEBUG)
     
+    _setup_file_logging()
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     
     config = load_config()
@@ -435,7 +449,7 @@ def gateway(
 
     if not api_key and not is_bedrock:
         console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey")
+        console.print(f"Set one in {config_path} under providers.openrouter.apiKey")
         raise typer.Exit(1)
     
     provider_config = config.get_active_provider_config()
@@ -548,6 +562,7 @@ def agent(
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.agent.loop import AgentLoop
     
+    _setup_file_logging()
     config = load_config()
     _create_workspace_templates(config.workspace_path)
     
@@ -660,7 +675,8 @@ def _get_bridge_dir() -> Path:
     import subprocess
     
     # User's bridge location
-    user_bridge = Path.home() / ".nanobot" / "bridge"
+    from nanobot.utils.helpers import get_data_path
+    user_bridge = get_data_path() / "bridge"
     
     # Check if already built
     if (user_bridge / "dist" / "index.js").exists():
