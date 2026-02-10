@@ -72,9 +72,15 @@ You have access to:
 
 ## Scheduled Reminders
 
-When user asks for a reminder at a specific time, use `exec` to run:
+When the user asks for a reminder at a specific time, schedule a cron job.
+
+- Use `--message` for a simple reminder text (agent_turn).
+- Use `--exec` for running scripts/commands directly (exec).
+
+Examples:
 ```
 nanobot cron add --name "reminder" --message "Your message" --at "YYYY-MM-DDTHH:MM:SS" --deliver --to "USER_ID" --channel "CHANNEL"
+nanobot cron add --name "job" --exec "python /path/task.py" --cron "0 9 * * *" --deliver --to "USER_ID" --channel "CHANNEL"
 ```
 Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegram` from `telegram:8281248569`).
 

@@ -89,9 +89,9 @@ Use for complex or time-consuming tasks that can run independently. The subagent
 
 ## Scheduled Reminders (Cron)
 
-Use the `exec` tool to create scheduled reminders with `nanobot cron add`:
+Use `nanobot cron add` to schedule either agent messages or shell commands.
 
-### Set a recurring reminder
+### Agent reminder (message)
 ```bash
 # Every day at 9am
 nanobot cron add --name "morning" --message "Good morning! ☀️" --cron "0 9 * * *"
@@ -100,10 +100,19 @@ nanobot cron add --name "morning" --message "Good morning! ☀️" --cron "0 9 *
 nanobot cron add --name "water" --message "Drink water! 💧" --every 7200
 ```
 
-### Set a one-time reminder
+### One-time reminder
 ```bash
 # At a specific time (ISO format)
 nanobot cron add --name "meeting" --message "Meeting starts now!" --at "2025-01-31T15:00:00"
+```
+
+### Execute a command
+```bash
+# Run a script every minute
+nanobot cron add --name "time" --exec "python /path/cron_time_notify.py" --cron "* * * * *"
+
+# Run with a working directory
+nanobot cron add --name "report" --exec "python report.py" --cwd "/path/to/project" --cron "0 9 * * *"
 ```
 
 ### Manage reminders

@@ -142,9 +142,15 @@ You have access to:
 
 ## Scheduled Reminders
 
-When user asks for a reminder at a specific time, use `exec` to run:
+When the user asks for a reminder at a specific time, schedule a cron job.
+
+- Use `--message` for a simple reminder text (agent_turn).
+- Use `--exec` for running scripts/commands directly (exec).
+
+Examples:
 ```
 nanobot cron add --name "reminder" --message "Your message" --at "YYYY-MM-DDTHH:MM:SS" --deliver --to "USER_ID" --channel "CHANNEL"
+nanobot cron add --name "job" --exec "python /path/task.py" --cron "0 9 * * *" --deliver --to "USER_ID" --channel "CHANNEL"
 ```
 Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegram` from `telegram:8281248569`).
 
@@ -279,9 +285,9 @@ spawn(task: str, label: str = None) -> str
 
 ## Scheduled Reminders (Cron)
 
-Use the exec tool to create scheduled reminders with nanobot cron add:
+Use nanobot cron add to schedule either agent messages or shell commands.
 
-### Set a recurring reminder
+### Agent reminder (message)
 ```bash
 # Every day at 9am
 nanobot cron add --name "morning" --message "Good morning!" --cron "0 9 * * *"
@@ -290,10 +296,19 @@ nanobot cron add --name "morning" --message "Good morning!" --cron "0 9 * * *"
 nanobot cron add --name "water" --message "Drink water!" --every 7200
 ```
 
-### Set a one-time reminder
+### One-time reminder
 ```bash
 # At a specific time (ISO format)
 nanobot cron add --name "meeting" --message "Meeting starts now!" --at "2025-01-31T15:00:00"
+```
+
+### Execute a command
+```bash
+# Run a script every minute
+nanobot cron add --name "time" --exec "python /path/cron_time_notify.py" --cron "* * * * *"
+
+# Run with a working directory
+nanobot cron add --name "report" --exec "python report.py" --cwd "/path/to/project" --cron "0 9 * * *"
 ```
 
 ### Manage reminders
@@ -483,10 +498,24 @@ def gateway(
     # Create cron service
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
-        response = await agent.process_direct(
-            job.payload.message,
-            session_key=f"cron:{job.id}"
-        )
+        response: str | None
+        if job.payload.kind == "exec":
+            command = job.payload.command or job.payload.message
+            if not command:
+                response = "Error: cron exec job missing command"
+            else:
+                response = await agent.tools.execute(
+                    "exec",
+                    {
+                        "command": command,
+                        "working_dir": job.payload.working_dir,
+                    },
+                )
+        else:
+            response = await agent.process_direct(
+                job.payload.message,
+                session_key=f"cron:{job.id}"
+            )
         # Optionally deliver to channel
         if job.payload.deliver and job.payload.to:
             from nanobot.bus.events import OutboundMessage
@@ -774,6 +803,7 @@ def cron_list(
     table = Table(title="Scheduled Jobs")
     table.add_column("ID", style="cyan")
     table.add_column("Name")
+    table.add_column("Kind")
     table.add_column("Schedule")
     table.add_column("Status")
     table.add_column("Next Run")
@@ -796,7 +826,7 @@ def cron_list(
         
         status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
         
-        table.add_row(job.id, job.name, sched, status, next_run)
+        table.add_row(job.id, job.name, job.payload.kind, sched, status, next_run)
     
     console.print(table)
 
@@ -804,7 +834,9 @@ def cron_list(
 @cron_app.command("add")
 def cron_add(
     name: str = typer.Option(..., "--name", "-n", help="Job name"),
-    message: str = typer.Option(..., "--message", "-m", help="Message for agent"),
+    message: str | None = typer.Option(None, "--message", "-m", help="Message for agent"),
+    exec_command: str | None = typer.Option(None, "--exec", help="Shell command to execute"),
+    cwd: str | None = typer.Option(None, "--cwd", help="Working directory for --exec"),
     every: int = typer.Option(None, "--every", "-e", help="Run every N seconds"),
     cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * *')"),
     at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
@@ -830,13 +862,24 @@ def cron_add(
         console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
         raise typer.Exit(1)
     
+    if exec_command and message:
+        console.print("[red]Error: Use --message or --exec, not both[/red]")
+        raise typer.Exit(1)
+    if not exec_command and not message:
+        console.print("[red]Error: Must specify --message or --exec[/red]")
+        raise typer.Exit(1)
+
+    payload_kind = "exec" if exec_command else "agent_turn"
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)
     
     job = service.add_job(
         name=name,
         schedule=schedule,
-        message=message,
+        message=message or "",
+        payload_kind=payload_kind,
+        command=exec_command or "",
+        working_dir=cwd,
         deliver=deliver,
         to=to,
         channel=channel,
@@ -888,17 +931,89 @@ def cron_run(
     force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
 ):
     """Manually run a job."""
-    from nanobot.config.loader import get_data_dir
+    from nanobot.config.loader import get_data_dir, load_config
     from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronJob
+    from nanobot.agent.tools.shell import ExecTool
+    from nanobot.bus.queue import MessageBus
+    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.agent.loop import AgentLoop
     
     store_path = get_data_dir() / "cron" / "jobs.json"
-    service = CronService(store_path)
-    
+    config = load_config()
+    _create_workspace_templates(config.workspace_path)
+
+    # Lightweight exec tool for exec-type cron jobs.
+    exec_tool = ExecTool(
+        working_dir=str(config.workspace_path),
+        timeout=config.tools.exec.timeout,
+        restrict_to_workspace=config.tools.exec.restrict_to_workspace,
+    )
+
+    agent_loop: AgentLoop | None = None
+
+    async def on_cron_job(job: CronJob) -> str | None:
+        nonlocal agent_loop, last_response
+        if job.payload.kind == "exec":
+            command = job.payload.command or job.payload.message
+            if not command:
+                last_response = "Error: cron exec job missing command"
+                return last_response
+            last_response = await exec_tool.execute(command, working_dir=job.payload.working_dir)
+            return last_response
+
+        # agent_turn path
+        if agent_loop is None:
+            api_key = config.get_api_key()
+            api_base = config.get_api_base()
+            model = config.agents.defaults.model
+            is_bedrock = model.startswith("bedrock/")
+            if not api_key and not is_bedrock:
+                last_response = "Error: No API key configured."
+                return last_response
+
+            bus = MessageBus()
+            provider_config = config.get_active_provider_config()
+            force_chat_completions = bool(provider_config and provider_config.force_chat_completions)
+            strip_temperature = bool(provider_config and provider_config.strip_temperature)
+            web_search_provider, openai_web_search_config = _build_web_search_settings(config)
+            provider_name = config.get_active_provider_name()
+            provider = LiteLLMProvider(
+                api_key=api_key,
+                api_base=api_base,
+                default_model=config.agents.defaults.model,
+                force_chat_completions=force_chat_completions,
+                strip_temperature=strip_temperature,
+                provider_name=provider_name,
+                openai_web_search=web_search_provider == "openai",
+                openai_web_search_config=openai_web_search_config,
+            )
+
+            agent_loop = AgentLoop(
+                bus=bus,
+                provider=provider,
+                workspace=config.workspace_path,
+                brave_api_key=config.tools.web.search.api_key or None,
+                web_search_provider=web_search_provider,
+                exec_config=config.tools.exec,
+            )
+
+        last_response = await agent_loop.process_direct(
+            job.payload.message, session_key=f"cron:{job.id}"
+        )
+        return last_response
+
+    service = CronService(store_path, on_job=on_cron_job)
+    last_response: str | None = None
+
     async def run():
-        return await service.run_job(job_id, force=force)
-    
+        result = await service.run_job(job_id, force=force)
+        return result
+
     if asyncio.run(run()):
         console.print(f"[green]✓[/green] Job executed")
+        if last_response:
+            console.print(last_response)
     else:
         console.print(f"[red]Failed to run job {job_id}[/red]")
 
