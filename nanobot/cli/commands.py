@@ -346,6 +346,10 @@ If this file has no tasks (only headers and comments), the agent will skip the h
     
     for filename, content in templates.items():
         file_path = workspace / filename
+        if filename == "AGENTS.md":
+            file_path.write_text(content)
+            console.print(f"  [dim]Updated {filename}[/dim]")
+            continue
         if not file_path.exists():
             file_path.write_text(content)
             console.print(f"  [dim]Created {filename}[/dim]")
