@@ -59,6 +59,7 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `summarize` | Summarize or extract text/transcripts from URLs, podcasts, and local files (great fallback for “transcribe this YouTube/video”). |
 | `tmux` | Remote-control tmux sessions for interactive CLIs by sending keystrokes and scraping pane output. |
 | `trello` | Manage Trello boards, lists, and cards via the Trello REST API. |
+| `twitter-viewer` | Fetch X/Twitter user timelines (paged) and single tweets via twitter-viewer.com API. |
 | `video-frames` | Extract frames or short clips from videos using ffmpeg. |
 | `voice-call` | Start voice calls via the OpenClaw voice-call plugin. |
 | `wacli` | Send WhatsApp messages to other people or search/sync WhatsApp history via the wacli CLI (not for normal user chats). |
