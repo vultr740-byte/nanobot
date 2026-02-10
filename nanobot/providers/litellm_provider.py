@@ -197,7 +197,7 @@ class LiteLLMProvider(LLMProvider):
                         self.api_base or "default",
                     )
                 return LLMResponse(
-                    content=f"Error calling LLM: {str(e)}",
+                    content=self._user_facing_error(e),
                     finish_reason="error",
                 )
 
@@ -286,7 +286,7 @@ class LiteLLMProvider(LLMProvider):
                 )
             # Return error as content for graceful handling
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=self._user_facing_error(e),
                 finish_reason="error",
             )
 
@@ -408,6 +408,23 @@ class LiteLLMProvider(LLMProvider):
             out[key] = value
 
         return out
+
+    @staticmethod
+    def _user_facing_error(exc: Exception) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if status == 402:
+                return "模型服务计费/额度不足，请检查 API 余额或代理配置。"
+            if status in (401, 403):
+                return "模型服务认证失败或权限不足，请检查 API Key/权限配置。"
+            if status == 429:
+                return "模型服务请求过多或被限流，请稍后重试。"
+            if 500 <= status < 600:
+                return "模型服务暂时不可用，请稍后重试。"
+            return "模型服务请求失败，请稍后重试。"
+        if isinstance(exc, httpx.RequestError):
+            return "模型服务网络异常，请稍后重试。"
+        return "模型服务调用失败，请稍后重试。"
 
     @staticmethod
     def _select_response_headers(headers: Any) -> dict[str, str]:
