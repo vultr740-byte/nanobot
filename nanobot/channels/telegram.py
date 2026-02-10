@@ -90,6 +90,8 @@ class _PendingTextEntry:
     chat_id: int
     texts: list[str]
     metadata: dict[str, Any]
+    reply_prefix: str | None
+    reply_key: str | None
     last_message_id: int | None
     last_received_at: float
     timer: asyncio.Task | None = None
@@ -287,6 +289,100 @@ class TelegramChannel(BaseChannel):
             "is_group": message.chat.type != "private",
         }
 
+    @staticmethod
+    def _format_reply_user(user: User | None) -> str:
+        if not user:
+            return "Unknown"
+        if user.first_name and user.username:
+            return f"{user.first_name} (@{user.username})"
+        if user.first_name:
+            return user.first_name
+        if user.username:
+            return f"@{user.username}"
+        return str(user.id)
+
+    @staticmethod
+    def _summarize_reply_media(reply: Message) -> str:
+        parts: list[str] = []
+        if getattr(reply, "photo", None):
+            parts.append("photo")
+        if getattr(reply, "video", None):
+            parts.append("video")
+        if getattr(reply, "video_note", None):
+            parts.append("video_note")
+        if getattr(reply, "voice", None):
+            parts.append("voice")
+        if getattr(reply, "audio", None):
+            parts.append("audio")
+        if getattr(reply, "document", None):
+            doc = reply.document
+            name = getattr(doc, "file_name", None)
+            if name:
+                parts.append(f"document ({name})")
+            else:
+                parts.append("document")
+        if getattr(reply, "sticker", None):
+            parts.append("sticker")
+        if getattr(reply, "animation", None):
+            parts.append("animation")
+        if getattr(reply, "contact", None):
+            parts.append("contact")
+        if getattr(reply, "location", None):
+            parts.append("location")
+        if getattr(reply, "poll", None):
+            parts.append("poll")
+        if getattr(reply, "dice", None):
+            parts.append("dice")
+        if getattr(reply, "invoice", None):
+            parts.append("invoice")
+        return ", ".join(parts)
+
+    @classmethod
+    def _extract_reply_context(
+        cls, message: Message | None
+    ) -> tuple[str | None, dict[str, Any], str | None]:
+        if not message:
+            return None, {}, None
+        reply = getattr(message, "reply_to_message", None)
+        if not reply:
+            return None, {}, None
+
+        reply_user = getattr(reply, "from_user", None)
+        reply_text = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+        reply_media = cls._summarize_reply_media(reply)
+        reply_message_id = getattr(reply, "message_id", None)
+        reply_date = getattr(reply, "date", None)
+
+        metadata: dict[str, Any] = {
+            "reply_to_message_id": reply_message_id,
+            "reply_to_user_id": getattr(reply_user, "id", None),
+            "reply_to_username": getattr(reply_user, "username", None),
+            "reply_to_first_name": getattr(reply_user, "first_name", None),
+            "reply_to_text": reply_text,
+            "reply_to_media": reply_media,
+            "reply_to_has_media": bool(reply_media),
+            "reply_to_date": reply_date.isoformat() if reply_date else None,
+        }
+
+        lines = ["[Reply Context]"]
+        if reply_user:
+            lines.append(
+                f"From: {cls._format_reply_user(reply_user)} (id: {reply_user.id})"
+            )
+        if reply_message_id is not None:
+            lines.append(f"Message ID: {reply_message_id}")
+        if reply_text:
+            lines.append("Text:")
+            lines.append(reply_text)
+        else:
+            lines.append("Text: [none]")
+        if reply_media:
+            lines.append(f"Media: {reply_media}")
+        lines.append("[/Reply Context]")
+
+        reply_key = str(reply_message_id) if reply_message_id is not None else None
+        return "\n".join(lines), metadata, reply_key
+
     async def _send_typing(self, chat_id: int) -> None:
         if not self._app:
             return
@@ -436,6 +532,11 @@ class TelegramChannel(BaseChannel):
 
     async def _emit_text_entry(self, entry: _PendingTextEntry, joiner: str) -> None:
         content = joiner.join(entry.texts).strip()
+        if entry.reply_prefix:
+            if content:
+                content = f"{entry.reply_prefix}\n\n{content}"
+            else:
+                content = entry.reply_prefix
         if not content:
             return
         await self._send_typing(entry.chat_id)
@@ -474,20 +575,31 @@ class TelegramChannel(BaseChannel):
         await self._emit_text_entry(entry, "")
 
     async def _enqueue_debounced_text(self, key: str, entry: _PendingTextEntry, text: str) -> None:
+        to_flush: _PendingTextEntry | None = None
         async with self._pending_lock:
             existing = self._debounce_entries.get(key)
             if existing:
-                existing.texts.append(text)
-                existing.metadata = entry.metadata
-                existing.last_message_id = entry.last_message_id
-                existing.last_received_at = entry.last_received_at
-                if existing.timer:
-                    existing.timer.cancel()
-                existing.timer = asyncio.create_task(self._schedule_debounce_flush(key, existing))
-                return
+                if existing.reply_key != entry.reply_key:
+                    if existing.timer:
+                        existing.timer.cancel()
+                    self._debounce_entries.pop(key, None)
+                    to_flush = existing
+                else:
+                    existing.texts.append(text)
+                    existing.metadata = entry.metadata
+                    if entry.reply_prefix and not existing.reply_prefix:
+                        existing.reply_prefix = entry.reply_prefix
+                    existing.last_message_id = entry.last_message_id
+                    existing.last_received_at = entry.last_received_at
+                    if existing.timer:
+                        existing.timer.cancel()
+                    existing.timer = asyncio.create_task(self._schedule_debounce_flush(key, existing))
+                    return
             entry.texts = [text]
             entry.timer = asyncio.create_task(self._schedule_debounce_flush(key, entry))
             self._debounce_entries[key] = entry
+        if to_flush:
+            await self._emit_text_entry(to_flush, "\n")
 
     async def _enqueue_text_fragment(self, key: str, entry: _PendingTextEntry, text: str) -> None:
         to_flush: _PendingTextEntry | None = None
@@ -496,11 +608,13 @@ class TelegramChannel(BaseChannel):
             if existing:
                 id_gap = (entry.last_message_id or 0) - (existing.last_message_id or 0)
                 time_gap = entry.last_received_at - existing.last_received_at
+                same_reply = existing.reply_key == entry.reply_key
                 can_append = (
                     id_gap > 0
                     and id_gap <= self._text_fragment_max_id_gap
                     and time_gap >= 0
                     and time_gap <= (self._text_fragment_max_gap_ms / 1000)
+                    and same_reply
                 )
                 total_chars = sum(len(t) for t in existing.texts) + len(text)
                 if (
@@ -510,6 +624,8 @@ class TelegramChannel(BaseChannel):
                 ):
                     existing.texts.append(text)
                     existing.metadata = entry.metadata
+                    if entry.reply_prefix and not existing.reply_prefix:
+                        existing.reply_prefix = entry.reply_prefix
                     existing.last_message_id = entry.last_message_id
                     existing.last_received_at = entry.last_received_at
                     if existing.timer:
@@ -696,6 +812,9 @@ class TelegramChannel(BaseChannel):
         is_command = bool(message.text and self._is_command_text(message.text))
         key = self._pending_key(chat_id, sender_id)
         metadata = self._build_metadata(message, user)
+        reply_prefix, reply_metadata, reply_key = self._extract_reply_context(message)
+        if reply_metadata:
+            metadata.update(reply_metadata)
 
         # Debounce and merge text-only messages (skip commands).
         if text_content and not has_media and not is_command:
@@ -704,6 +823,8 @@ class TelegramChannel(BaseChannel):
                 chat_id=chat_id,
                 texts=[text_content],
                 metadata=metadata,
+                reply_prefix=reply_prefix,
+                reply_key=reply_key,
                 last_message_id=message.message_id,
                 last_received_at=time.monotonic(),
             )
@@ -727,6 +848,9 @@ class TelegramChannel(BaseChannel):
         # Build content from text and/or media
         content_parts = []
         media_paths = []
+
+        if reply_prefix:
+            content_parts.append(reply_prefix)
         
         # Text content
         if message.text:
