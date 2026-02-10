@@ -504,13 +504,10 @@ def gateway(
             if not command:
                 response = "Error: cron exec job missing command"
             else:
-                response = await agent.tools.execute(
-                    "exec",
-                    {
-                        "command": command,
-                        "working_dir": job.payload.working_dir,
-                    },
-                )
+                params = {"command": command}
+                if job.payload.working_dir:
+                    params["working_dir"] = job.payload.working_dir
+                response = await agent.tools.execute("exec", params)
         else:
             response = await agent.process_direct(
                 job.payload.message,
