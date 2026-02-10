@@ -110,7 +110,7 @@ class ExecTool(Tool):
             if process.returncode != 0:
                 output_parts.append(f"\nExit code: {process.returncode}")
             
-            result = "\n".join(output_parts) if output_parts else "(no output)"
+            result = "\n".join(output_parts) if output_parts else ""
             
             # Truncate very long output
             max_len = 10000
