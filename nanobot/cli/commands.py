@@ -117,6 +117,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 - Always explain what you're doing before taking actions
 - Ask for clarification when the request is ambiguous
 - Use tools to help accomplish tasks
+- For X/Twitter queries (tweets, timelines, tweetId/status links), scan skills list and use the most relevant skill first (read its SKILL.md).
 - Remember important information in your memory files
 
 ## Tools Available
