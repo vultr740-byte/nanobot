@@ -45,12 +45,17 @@ class CronService:
     def __init__(
         self,
         store_path: Path,
-        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None
+        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None,
+        watch_interval_s: float = 5.0,
     ):
         self.store_path = store_path
         self.on_job = on_job  # Callback to execute job, returns response text
+        self.watch_interval_s = watch_interval_s
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
+        self._watch_task: asyncio.Task | None = None
+        self._store_mtime: float | None = None
+        self._lock = asyncio.Lock()
         self._running = False
     
     def _load_store(self) -> CronStore:
@@ -147,6 +152,36 @@ class CronService:
         }
         
         self.store_path.write_text(json.dumps(data, indent=2))
+        self._store_mtime = self._get_store_mtime()
+
+    def _get_store_mtime(self) -> float | None:
+        try:
+            return self.store_path.stat().st_mtime
+        except FileNotFoundError:
+            return None
+
+    async def _reload_store_if_changed(self) -> None:
+        current_mtime = self._get_store_mtime()
+        if current_mtime == self._store_mtime:
+            return
+        async with self._lock:
+            current_mtime = self._get_store_mtime()
+            if current_mtime == self._store_mtime:
+                return
+            self._store_mtime = current_mtime
+            # Force reload from disk
+            self._store = None
+            self._load_store()
+            # Only compute missing next-run times to avoid resetting schedules
+            self._recompute_next_runs(only_missing=True)
+            self._save_store()
+            self._arm_timer()
+            logger.info("Cron: reloaded jobs from disk")
+
+    async def _watch_store(self) -> None:
+        while self._running:
+            await asyncio.sleep(self.watch_interval_s)
+            await self._reload_store_if_changed()
     
     async def start(self) -> None:
         """Start the cron service."""
@@ -155,6 +190,8 @@ class CronService:
         self._recompute_next_runs()
         self._save_store()
         self._arm_timer()
+        if self.watch_interval_s > 0:
+            self._watch_task = asyncio.create_task(self._watch_store())
         logger.info(f"Cron service started with {len(self._store.jobs if self._store else [])} jobs")
     
     def stop(self) -> None:
@@ -163,14 +200,19 @@ class CronService:
         if self._timer_task:
             self._timer_task.cancel()
             self._timer_task = None
+        if self._watch_task:
+            self._watch_task.cancel()
+            self._watch_task = None
     
-    def _recompute_next_runs(self) -> None:
+    def _recompute_next_runs(self, only_missing: bool = False) -> None:
         """Recompute next run times for all enabled jobs."""
         if not self._store:
             return
         now = _now_ms()
         for job in self._store.jobs:
             if job.enabled:
+                if only_missing and job.state.next_run_at_ms:
+                    continue
                 job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
     
     def _get_next_wake_ms(self) -> int | None:
@@ -204,18 +246,21 @@ class CronService:
         """Handle timer tick - run due jobs."""
         if not self._store:
             return
+
+        await self._reload_store_if_changed()
         
         now = _now_ms()
-        due_jobs = [
-            j for j in self._store.jobs
-            if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
-        ]
-        
-        for job in due_jobs:
-            await self._execute_job(job)
-        
-        self._save_store()
-        self._arm_timer()
+        async with self._lock:
+            due_jobs = [
+                j for j in self._store.jobs
+                if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
+            ]
+            
+            for job in due_jobs:
+                await self._execute_job(job)
+            
+            self._save_store()
+            self._arm_timer()
     
     async def _execute_job(self, job: CronJob) -> None:
         """Execute a single job."""
@@ -335,15 +380,16 @@ class CronService:
     async def run_job(self, job_id: str, force: bool = False) -> bool:
         """Manually run a job."""
         store = self._load_store()
-        for job in store.jobs:
-            if job.id == job_id:
-                if not force and not job.enabled:
-                    return False
-                await self._execute_job(job)
-                self._save_store()
-                self._arm_timer()
-                return True
-        return False
+        async with self._lock:
+            for job in store.jobs:
+                if job.id == job_id:
+                    if not force and not job.enabled:
+                        return False
+                    await self._execute_job(job)
+                    self._save_store()
+                    self._arm_timer()
+                    return True
+            return False
     
     def status(self) -> dict:
         """Get service status."""
