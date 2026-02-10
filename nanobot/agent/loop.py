@@ -188,6 +188,8 @@ class AgentLoop:
             history=session.get_history(),
             current_message=msg.content,
             media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
         )
         
         # Agent loop
@@ -326,7 +328,9 @@ class AgentLoop:
         # Build messages with the announce content
         messages = self.context.build_messages(
             history=session.get_history(),
-            current_message=msg.content
+            current_message=msg.content,
+            channel=origin_channel,
+            chat_id=origin_chat_id,
         )
         
         # Agent loop (limited for announce handling)

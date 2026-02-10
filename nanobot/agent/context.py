@@ -24,12 +24,19 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+    ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
         Args:
             skill_names: Optional list of skills to include.
+            channel: Optional current channel name.
+            chat_id: Optional current chat identifier.
         
         Returns:
             Complete system prompt.
@@ -49,6 +56,11 @@ class ContextBuilder:
         if memory:
             parts.append(f"# Memory\n\n{memory}")
         
+        # Runtime context (current channel/chat)
+        runtime_context = self._build_runtime_context(channel, chat_id)
+        if runtime_context:
+            parts.append(runtime_context)
+
         # Skills - progressive loading
         # 1. Always-loaded skills: include full content
         always_skills = self.skills.get_always_skills()
@@ -68,6 +80,26 @@ Skills with available="false" need dependencies installed first - you can try in
 {skills_summary}""")
         
         return "\n\n---\n\n".join(parts)
+
+    def _build_runtime_context(self, channel: str | None, chat_id: str | None) -> str:
+        if not channel:
+            return ""
+        channel_name = channel.strip().lower()
+        lines = [
+            "# Runtime Context",
+            f"Current channel: {channel_name}",
+        ]
+        if chat_id:
+            lines.append(f"Chat ID: {chat_id}")
+        lines.append(
+            "You must strictly follow the current channel's requirements for message format, file delivery, and link "
+            "presentation. Decide the exact formatting based on the channel and the user request."
+        )
+        lines.append(
+            "When the user asks for files/attachments, only claim they were sent if you actually used the message tool "
+            "with media. If you do not have a path or URL, ask for it or locate it with tools first."
+        )
+        return "\n".join(lines)
     
     def _get_identity(self) -> str:
         """Get the core identity section."""
@@ -120,6 +152,8 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         current_message: str,
         skill_names: list[str] | None = None,
         media: list[str] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -129,6 +163,8 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             current_message: The new user message.
             skill_names: Optional skills to include.
             media: Optional list of local file paths for images/media.
+            channel: Optional current channel name.
+            chat_id: Optional current chat identifier.
 
         Returns:
             List of messages including system prompt.
@@ -136,7 +172,11 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         messages = []
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        system_prompt = self.build_system_prompt(
+            skill_names=skill_names,
+            channel=channel,
+            chat_id=chat_id,
+        )
         messages.append({"role": "system", "content": system_prompt})
 
         # History
