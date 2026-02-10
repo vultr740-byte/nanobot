@@ -72,9 +72,13 @@ class ContextBuilder:
         # 2. Available skills: only show summary (agent uses read_file to load)
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
-            parts.append(f"""# Skills
+            parts.append(f"""# Skills (mandatory)
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
+Before replying: scan <skills> <description> entries.
+- If exactly one skill clearly applies: read its SKILL.md at <location> with `read_file`, then follow it.
+- If multiple could apply: choose the most specific one, then read/follow it.
+- If none clearly apply: do not read any SKILL.md.
+Constraints: never read more than one skill up front; only read after selecting.
 Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
 {skills_summary}""")
