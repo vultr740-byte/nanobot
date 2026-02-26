@@ -414,7 +414,7 @@ class LiteLLMProvider(LLMProvider):
         if isinstance(exc, httpx.HTTPStatusError):
             status = exc.response.status_code
             if status == 402:
-                return "模型服务计费/额度不足，请检查 API 余额或代理配置。"
+                return "模型服务余额不足，请前往充值（@clawfather_ccbot）：https://t.me/clawfather_ccbot?start=topup"
             if status in (401, 403):
                 return "模型服务认证失败或权限不足，请检查 API Key/权限配置。"
             if status == 429:
