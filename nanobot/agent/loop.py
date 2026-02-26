@@ -195,6 +195,7 @@ class AgentLoop:
         # Agent loop
         iteration = 0
         final_content = None
+        final_metadata: dict[str, Any] | None = None
         reaction_message_id = msg.metadata.get("message_id") if msg.metadata else None
         reaction_hint_sent = False
         
@@ -271,6 +272,7 @@ class AgentLoop:
             else:
                 # No tool calls, we're done
                 final_content = response.content
+                final_metadata = response.metadata or None
                 break
         
         if final_content is None:
@@ -282,6 +284,8 @@ class AgentLoop:
         self.sessions.save(session)
 
         outbound_metadata = {}
+        if final_metadata:
+            outbound_metadata.update(final_metadata)
         thinking_message_id = msg.metadata.get("thinking_message_id")
         if thinking_message_id:
             outbound_metadata["edit_message_id"] = thinking_message_id
@@ -336,6 +340,7 @@ class AgentLoop:
         # Agent loop (limited for announce handling)
         iteration = 0
         final_content = None
+        final_metadata: dict[str, Any] | None = None
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -371,6 +376,7 @@ class AgentLoop:
                     )
             else:
                 final_content = response.content
+                final_metadata = response.metadata or None
                 break
         
         if final_content is None:
@@ -382,6 +388,8 @@ class AgentLoop:
         self.sessions.save(session)
 
         outbound_metadata = {}
+        if final_metadata:
+            outbound_metadata.update(final_metadata)
         thinking_message_id = msg.metadata.get("thinking_message_id")
         if thinking_message_id:
             outbound_metadata["edit_message_id"] = thinking_message_id

@@ -196,9 +196,11 @@ class LiteLLMProvider(LLMProvider):
                         model,
                         self.api_base or "default",
                     )
+                error_content, error_metadata = self._user_facing_error(e)
                 return LLMResponse(
-                    content=self._user_facing_error(e),
+                    content=error_content,
                     finish_reason="error",
+                    metadata=error_metadata,
                 )
 
         kwargs: dict[str, Any] = {
@@ -285,9 +287,11 @@ class LiteLLMProvider(LLMProvider):
                     self.is_vllm,
                 )
             # Return error as content for graceful handling
+            error_content, error_metadata = self._user_facing_error(e)
             return LLMResponse(
-                content=self._user_facing_error(e),
+                content=error_content,
                 finish_reason="error",
+                metadata=error_metadata,
             )
 
     async def _chat_completions_httpx(self, kwargs: dict[str, Any], request_id: str) -> dict[str, Any]:
@@ -410,21 +414,31 @@ class LiteLLMProvider(LLMProvider):
         return out
 
     @staticmethod
-    def _user_facing_error(exc: Exception) -> str:
+    def _user_facing_error(exc: Exception) -> tuple[str, dict[str, Any]]:
         if isinstance(exc, httpx.HTTPStatusError):
             status = exc.response.status_code
             if status == 402:
-                return "模型服务余额不足，请前往充值（@clawfather_ccbot）：https://t.me/clawfather_ccbot?start=topup"
+                return (
+                    "模型服务余额不足，请前往充值（@clawfather_ccbot）。",
+                    {
+                        "buttons": [
+                            {
+                                "text": "去充值",
+                                "url": "https://t.me/clawfather_ccbot?start=topup",
+                            }
+                        ]
+                    },
+                )
             if status in (401, 403):
-                return "模型服务认证失败或权限不足，请检查 API Key/权限配置。"
+                return "模型服务认证失败或权限不足，请检查 API Key/权限配置。", {}
             if status == 429:
-                return "模型服务请求过多或被限流，请稍后重试。"
+                return "模型服务请求过多或被限流，请稍后重试。", {}
             if 500 <= status < 600:
-                return "模型服务暂时不可用，请稍后重试。"
-            return "模型服务请求失败，请稍后重试。"
+                return "模型服务暂时不可用，请稍后重试。", {}
+            return "模型服务请求失败，请稍后重试。", {}
         if isinstance(exc, httpx.RequestError):
-            return "模型服务网络异常，请稍后重试。"
-        return "模型服务调用失败，请稍后重试。"
+            return "模型服务网络异常，请稍后重试。", {}
+        return "模型服务调用失败，请稍后重试。", {}
 
     @staticmethod
     def _select_response_headers(headers: Any) -> dict[str, str]:

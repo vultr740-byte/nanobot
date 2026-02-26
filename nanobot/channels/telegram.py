@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from loguru import logger
-from telegram import Update, InputFile, Message, User
+from telegram import Update, InputFile, Message, User, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ReactionEmoji
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
@@ -724,6 +724,22 @@ class TelegramChannel(BaseChannel):
         if msg.content or msg.media:
             await self._cancel_feedback(chat_id)
 
+        reply_markup = None
+        buttons = None
+        if msg.metadata:
+            buttons = msg.metadata.get("buttons")
+        if isinstance(buttons, list) and buttons:
+            keyboard: list[list[InlineKeyboardButton]] = []
+            for item in buttons:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                url = item.get("url")
+                if text and url:
+                    keyboard.append([InlineKeyboardButton(text=text, url=url)])
+            if keyboard:
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
         # 1) Send text content as a separate message (or edit if requested).
         if msg.content:
             edit_message_id = None
@@ -737,20 +753,23 @@ class TelegramChannel(BaseChannel):
                             chat_id=chat_id,
                             message_id=int(edit_message_id),
                             text=html_content,
-                            parse_mode="HTML"
+                            parse_mode="HTML",
+                            reply_markup=reply_markup,
                         )
                     except Exception as e:
                         logger.warning(f"Error editing Telegram message: {e}")
                         await self._app.bot.send_message(
                             chat_id=chat_id,
                             text=html_content,
-                            parse_mode="HTML"
+                            parse_mode="HTML",
+                            reply_markup=reply_markup,
                         )
                 else:
                     await self._app.bot.send_message(
                         chat_id=chat_id,
                         text=html_content,
-                        parse_mode="HTML"
+                        parse_mode="HTML",
+                        reply_markup=reply_markup,
                     )
             except Exception as e:
                 # Fallback to plain text if HTML parsing fails
@@ -760,12 +779,14 @@ class TelegramChannel(BaseChannel):
                         await self._app.bot.edit_message_text(
                             chat_id=chat_id,
                             message_id=int(edit_message_id),
-                            text=msg.content
+                            text=msg.content,
+                            reply_markup=reply_markup,
                         )
                     else:
                         await self._app.bot.send_message(
                             chat_id=chat_id,
-                            text=msg.content
+                            text=msg.content,
+                            reply_markup=reply_markup,
                         )
                 except Exception as e2:
                     logger.error(f"Error sending Telegram message: {e2}")
