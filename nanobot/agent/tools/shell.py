@@ -3,7 +3,6 @@
 import asyncio
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +19,7 @@ class ExecTool(Tool):
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
+        path_append: str = "",
     ):
         self.timeout = timeout
         self.working_dir = working_dir
@@ -27,7 +27,8 @@ class ExecTool(Tool):
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
             r"\brmdir\s+/s\b",               # rmdir /s
-            r"\b(format|mkfs|diskpart)\b",   # disk operations
+            r"(?:^|[;&|]\s*)format\b",       # format (as standalone command only)
+            r"\b(mkfs|diskpart)\b",          # disk operations
             r"\bdd\s+if=",                   # dd
             r">\s*/dev/sd",                  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
@@ -35,8 +36,7 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
-        self._bash_path: str | None = None
-        self._bash_checked = False
+        self.path_append = path_append
     
     @property
     def name(self) -> str:
@@ -69,24 +69,18 @@ class ExecTool(Tool):
         if guard_error:
             return guard_error
         
+        env = os.environ.copy()
+        if self.path_append:
+            env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
+
         try:
-            bash_path = self._get_bash_path()
-            if bash_path:
-                process = await asyncio.create_subprocess_exec(
-                    bash_path,
-                    "-lc",
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd,
-                )
-            else:
-                process = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd,
-                )
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+            )
             
             try:
                 stdout, stderr = await asyncio.wait_for(
@@ -95,6 +89,12 @@ class ExecTool(Tool):
                 )
             except asyncio.TimeoutError:
                 process.kill()
+                # Wait for the process to fully terminate so pipes are
+                # drained and file descriptors are released.
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
                 return f"Error: Command timed out after {self.timeout} seconds"
             
             output_parts = []
@@ -110,7 +110,7 @@ class ExecTool(Tool):
             if process.returncode != 0:
                 output_parts.append(f"\nExit code: {process.returncode}")
             
-            result = "\n".join(output_parts) if output_parts else ""
+            result = "\n".join(output_parts) if output_parts else "(no output)"
             
             # Truncate very long output
             max_len = 10000
@@ -121,21 +121,6 @@ class ExecTool(Tool):
             
         except Exception as e:
             return f"Error executing command: {str(e)}"
-
-    def _get_bash_path(self) -> str | None:
-        """Resolve bash path once; return None if unavailable."""
-        if self._bash_checked:
-            return self._bash_path
-        self._bash_checked = True
-        if os.name == "nt":
-            return None
-        candidates = ["/bin/bash", "/usr/bin/bash"]
-        for candidate in candidates:
-            if Path(candidate).exists():
-                self._bash_path = candidate
-                return self._bash_path
-        self._bash_path = shutil.which("bash")
-        return self._bash_path
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
@@ -156,15 +141,18 @@ class ExecTool(Tool):
 
             cwd_path = Path(cwd).resolve()
 
-            win_paths = re.findall(r"[A-Za-z]:\\[^\\\"']+", cmd)
-            posix_paths = re.findall(r"/[^\s\"']+", cmd)
-
-            for raw in win_paths + posix_paths:
+            for raw in self._extract_absolute_paths(cmd):
                 try:
-                    p = Path(raw).resolve()
+                    p = Path(raw.strip()).resolve()
                 except Exception:
                     continue
-                if cwd_path not in p.parents and p != cwd_path:
+                if p.is_absolute() and cwd_path not in p.parents and p != cwd_path:
                     return "Error: Command blocked by safety guard (path outside working dir)"
 
         return None
+
+    @staticmethod
+    def _extract_absolute_paths(command: str) -> list[str]:
+        win_paths = re.findall(r"[A-Za-z]:\\[^\s\"'|><;]+", command)   # Windows: C:\...
+        posix_paths = re.findall(r"(?:^|[\s|>])(/[^\s\"'>]+)", command) # POSIX: /absolute only
+        return win_paths + posix_paths

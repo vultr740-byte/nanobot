@@ -3,6 +3,8 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
+from loguru import logger
+
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 
@@ -87,7 +89,8 @@ class BaseChannel(ABC):
         chat_id: str,
         content: str,
         media: list[str] | None = None,
-        metadata: dict[str, Any] | None = None
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
     ) -> None:
         """
         Handle an incoming message from the chat platform.
@@ -100,8 +103,14 @@ class BaseChannel(ABC):
             content: Message text content.
             media: Optional list of media URLs.
             metadata: Optional channel-specific metadata.
+            session_key: Optional session key override (e.g. thread-scoped sessions).
         """
         if not self.is_allowed(sender_id):
+            logger.warning(
+                "Access denied for sender {} on channel {}. "
+                "Add them to allowFrom list in config to grant access.",
+                sender_id, self.name,
+            )
             return
         
         msg = InboundMessage(
@@ -110,7 +119,8 @@ class BaseChannel(ABC):
             chat_id=str(chat_id),
             content=content,
             media=media or [],
-            metadata=metadata or {}
+            metadata=metadata or {},
+            session_key_override=session_key,
         )
         
         await self.bus.publish_inbound(msg)
