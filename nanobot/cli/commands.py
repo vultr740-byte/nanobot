@@ -1,6 +1,7 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import json
 import os
 import signal
 from pathlib import Path
@@ -228,13 +229,59 @@ def _make_provider(config: Config):
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
 
+    web_search_provider, openai_web_search_config = _build_web_search_settings(config)
+
     return LiteLLMProvider(
         api_key=p.api_key if p else None,
         api_base=config.get_api_base(model),
         default_model=model,
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
+        openai_web_search=web_search_provider == "openai",
+        openai_web_search_config=openai_web_search_config,
     )
+
+
+def _build_web_search_settings(config: Config) -> tuple[str, dict | None]:
+    """Build web search provider settings from config."""
+    web_cfg = config.tools.web.search
+    provider = web_cfg.provider
+    active_provider = config.get_provider_name(config.agents.defaults.model)
+    provider_explicit = bool(os.getenv("NANOBOT_TOOLS__WEB__SEARCH__PROVIDER"))
+    if not provider_explicit:
+        try:
+            from nanobot.config.loader import get_config_path
+            config_path = get_config_path()
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    raw = json.load(f)
+                search_cfg = raw.get("tools", {}).get("web", {}).get("search", {})
+                provider_explicit = isinstance(search_cfg, dict) and "provider" in search_cfg
+        except Exception:
+            provider_explicit = False
+
+    # Auto-default to OpenAI web search when only OpenAI is viable.
+    if (
+        provider == "brave"
+        and active_provider == "openai"
+        and config.providers.openai.api_key
+        and not provider_explicit
+    ):
+        provider = "openai"
+
+    openai_settings = None
+    if provider == "openai":
+        openai_settings = {
+            "search_context_size": web_cfg.search_context_size,
+            "allowed_domains": web_cfg.allowed_domains,
+            "include_sources": web_cfg.include_sources,
+        }
+        if web_cfg.external_web_access is not None:
+            openai_settings["external_web_access"] = web_cfg.external_web_access
+        if web_cfg.user_location:
+            openai_settings["user_location"] = web_cfg.user_location.model_dump(exclude_none=True)
+
+    return provider, openai_settings
 
 
 # ============================================================================
@@ -265,6 +312,7 @@ def gateway(
     
     config = load_config()
     sync_workspace_templates(config.workspace_path)
+    web_search_provider, _ = _build_web_search_settings(config)
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
@@ -284,6 +332,7 @@ def gateway(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=web_search_provider,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -419,6 +468,7 @@ def agent(
     
     config = load_config()
     sync_workspace_templates(config.workspace_path)
+    web_search_provider, _ = _build_web_search_settings(config)
     
     bus = MessageBus()
     provider = _make_provider(config)
@@ -442,6 +492,7 @@ def agent(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=web_search_provider,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -921,6 +972,7 @@ def cron_run(
     logger.disable("nanobot")
 
     config = load_config()
+    web_search_provider, _ = _build_web_search_settings(config)
     provider = _make_provider(config)
     bus = MessageBus()
     agent_loop = AgentLoop(
@@ -933,6 +985,7 @@ def cron_run(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
+        web_search_provider=web_search_provider,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,

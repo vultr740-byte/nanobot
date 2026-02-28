@@ -1,18 +1,24 @@
 """Telegram channel implementation using python-telegram-bot."""
 
-from __future__ import annotations
-
 import asyncio
+import mimetypes
 import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
 from loguru import logger
-from telegram import BotCommand, Update, ReplyParameters
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.request import HTTPXRequest
+from telegram import Update, InputFile, Message, User, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction, ReactionEmoji
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
+from nanobot.utils.helpers import get_data_path
 
 
 def _markdown_to_telegram_html(text: str) -> str:
@@ -78,24 +84,26 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
-def _split_message(content: str, max_len: int = 4000) -> list[str]:
-    """Split content into chunks within max_len, preferring line breaks."""
-    if len(content) <= max_len:
-        return [content]
-    chunks: list[str] = []
-    while content:
-        if len(content) <= max_len:
-            chunks.append(content)
-            break
-        cut = content[:max_len]
-        pos = cut.rfind('\n')
-        if pos == -1:
-            pos = cut.rfind(' ')
-        if pos == -1:
-            pos = max_len
-        chunks.append(content[:pos])
-        content = content[pos:].lstrip()
-    return chunks
+@dataclass
+class _PendingTextEntry:
+    sender_id: str
+    chat_id: int
+    texts: list[str]
+    metadata: dict[str, Any]
+    reply_prefix: str | None
+    reply_key: str | None
+    last_message_id: int | None
+    last_received_at: float
+    timer: asyncio.Task | None = None
+
+
+@dataclass
+class _PendingFeedback:
+    chat_id: int
+    message_id: int | None
+    emoji: str
+    sent: bool = False
+    timer: asyncio.Task | None = None
 
 
 class TelegramChannel(BaseChannel):
@@ -107,28 +115,31 @@ class TelegramChannel(BaseChannel):
     
     name = "telegram"
     
-    # Commands registered with Telegram's command menu
-    BOT_COMMANDS = [
-        BotCommand("start", "Start the bot"),
-        BotCommand("new", "Start a new conversation"),
-        BotCommand("stop", "Stop the current task"),
-        BotCommand("help", "Show available commands"),
-    ]
-    
-    def __init__(
-        self,
-        config: TelegramConfig,
-        bus: MessageBus,
-        groq_api_key: str = "",
-    ):
+    def __init__(self, config: TelegramConfig, bus: MessageBus, groq_api_key: str = ""):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
-        self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
-        self._media_group_buffers: dict[str, dict] = {}
-        self._media_group_tasks: dict[str, asyncio.Task] = {}
+        self._pending_lock = asyncio.Lock()
+        self._feedback_lock = asyncio.Lock()
+        self._debounce_entries: dict[str, _PendingTextEntry] = {}
+        self._text_fragment_entries: dict[str, _PendingTextEntry] = {}
+        self._pending_feedback: dict[int, _PendingFeedback] = {}
+        # Debounce settings (ms) and text fragment stitching (OpenClaw-style defaults).
+        self._debounce_ms = int(getattr(config, "debounce_ms", 600))
+        self._text_fragment_start_threshold = int(getattr(config, "text_fragment_start_threshold", 4000))
+        self._text_fragment_max_gap_ms = int(getattr(config, "text_fragment_max_gap_ms", 1500))
+        self._text_fragment_max_id_gap = int(getattr(config, "text_fragment_max_id_gap", 1))
+        self._text_fragment_max_parts = int(getattr(config, "text_fragment_max_parts", 12))
+        self._text_fragment_max_total_chars = int(getattr(config, "text_fragment_max_total_chars", 50_000))
+        # Typing feedback reaction settings.
+        self._typing_feedback_delay_s = float(getattr(config, "typing_feedback_delay_s", 6.0))
+        self._typing_window_s = float(getattr(config, "typing_window_s", 5.0))
+        self._typing_feedback_grace_s = float(getattr(config, "typing_feedback_grace_s", 1.0))
+        self._typing_feedback_emoji = getattr(config, "typing_feedback_emoji", "") or "👀"
+        self._typing_feedback_long_emoji = getattr(config, "typing_feedback_long_emoji", "") or "⏳"
+        self._allowed_reactions = {e.value for e in ReactionEmoji}
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -138,18 +149,12 @@ class TelegramChannel(BaseChannel):
         
         self._running = True
         
-        # Build the application with larger connection pool to avoid pool-timeout on long runs
-        req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
-        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
-        if self.config.proxy:
-            builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
-        self._app = builder.build()
-        self._app.add_error_handler(self._on_error)
-        
-        # Add command handlers
-        self._app.add_handler(CommandHandler("start", self._on_start))
-        self._app.add_handler(CommandHandler("new", self._forward_command))
-        self._app.add_handler(CommandHandler("help", self._on_help))
+        # Build the application
+        self._app = (
+            Application.builder()
+            .token(self.config.token)
+            .build()
+        )
         
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -160,21 +165,19 @@ class TelegramChannel(BaseChannel):
             )
         )
         
+        # Add /start command handler
+        from telegram.ext import CommandHandler
+        self._app.add_handler(CommandHandler("start", self._on_start))
+        
         logger.info("Starting Telegram bot (polling mode)...")
         
         # Initialize and start polling
         await self._app.initialize()
         await self._app.start()
         
-        # Get bot info and register command menu
+        # Get bot info
         bot_info = await self._app.bot.get_me()
-        logger.info("Telegram bot @{} connected", bot_info.username)
-        
-        try:
-            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
-            logger.debug("Telegram bot commands registered")
-        except Exception as e:
-            logger.warning("Failed to register bot commands: {}", e)
+        logger.info(f"Telegram bot @{bot_info.username} connected")
         
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
@@ -185,140 +188,109 @@ class TelegramChannel(BaseChannel):
         # Keep running until stopped
         while self._running:
             await asyncio.sleep(1)
-    
-    async def stop(self) -> None:
-        """Stop the Telegram bot."""
-        self._running = False
-        
-        # Cancel all typing indicators
-        for chat_id in list(self._typing_tasks):
-            self._stop_typing(chat_id)
 
-        for task in self._media_group_tasks.values():
-            task.cancel()
-        self._media_group_tasks.clear()
-        self._media_group_buffers.clear()
-        
-        if self._app:
-            logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
-            self._app = None
-    
+    async def _send_media(self, chat_id: int, media_ref: str) -> None:
+        """Send a local file or URL as a Telegram media message."""
+        if not self._app:
+            return
+
+        is_url = self._is_url(media_ref)
+        media_type = self._guess_media_type(media_ref)
+
+        if is_url:
+            await self._send_remote_media(chat_id, media_ref, media_type)
+            return
+
+        path = Path(media_ref)
+        if not path.exists():
+            logger.warning(f"Media path not found: {media_ref}")
+            return
+
+        # Send local file without loading into memory
+        if media_type == "photo":
+            with path.open("rb") as f:
+                await self._app.bot.send_photo(chat_id=chat_id, photo=InputFile(f))
+            return
+        if media_type == "audio":
+            with path.open("rb") as f:
+                await self._app.bot.send_audio(chat_id=chat_id, audio=InputFile(f))
+            return
+        if media_type == "voice":
+            with path.open("rb") as f:
+                await self._app.bot.send_voice(chat_id=chat_id, voice=InputFile(f))
+            return
+
+        with path.open("rb") as f:
+            await self._app.bot.send_document(chat_id=chat_id, document=InputFile(f))
+
+    async def _send_remote_media(self, chat_id: int, url: str, media_type: str) -> None:
+        """Send a remote URL as Telegram media without downloading."""
+        if not self._app:
+            return
+
+        if media_type == "photo":
+            await self._app.bot.send_photo(chat_id=chat_id, photo=url)
+            return
+        if media_type == "audio":
+            await self._app.bot.send_audio(chat_id=chat_id, audio=url)
+            return
+        if media_type == "voice":
+            await self._app.bot.send_voice(chat_id=chat_id, voice=url)
+            return
+
+        await self._app.bot.send_document(chat_id=chat_id, document=url)
+
     @staticmethod
-    def _get_media_type(path: str) -> str:
-        """Guess media type from file extension."""
-        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-        if ext in ("jpg", "jpeg", "png", "gif", "webp"):
+    def _is_url(value: str) -> bool:
+        try:
+            parsed = urlparse(value)
+            return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _guess_media_type(value: str) -> str:
+        """Infer Telegram media type from URL or file path."""
+        mime, _ = mimetypes.guess_type(value)
+        if mime:
+            if mime.startswith("image/"):
+                return "photo"
+            if mime.startswith("audio/"):
+                # Prefer voice for ogg/opus
+                if mime in {"audio/ogg", "audio/opus"} or value.lower().endswith(".ogg"):
+                    return "voice"
+                return "audio"
+        lower = value.lower()
+        if lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
             return "photo"
-        if ext == "ogg":
+        if lower.endswith((".ogg", ".opus")):
             return "voice"
-        if ext in ("mp3", "m4a", "wav", "aac"):
+        if lower.endswith((".mp3", ".m4a", ".wav", ".flac", ".aac")):
             return "audio"
         return "document"
 
-    async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram."""
-        if not self._app:
-            logger.warning("Telegram bot not running")
-            return
-
-        self._stop_typing(msg.chat_id)
-
-        try:
-            chat_id = int(msg.chat_id)
-        except ValueError:
-            logger.error("Invalid chat_id: {}", msg.chat_id)
-            return
-
-        reply_params = None
-        if self.config.reply_to_message:
-            reply_to_message_id = msg.metadata.get("message_id")
-            if reply_to_message_id:
-                reply_params = ReplyParameters(
-                    message_id=reply_to_message_id,
-                    allow_sending_without_reply=True
-                )
-
-        # Send media files
-        for media_path in (msg.media or []):
-            try:
-                media_type = self._get_media_type(media_path)
-                sender = {
-                    "photo": self._app.bot.send_photo,
-                    "voice": self._app.bot.send_voice,
-                    "audio": self._app.bot.send_audio,
-                }.get(media_type, self._app.bot.send_document)
-                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
-                with open(media_path, 'rb') as f:
-                    await sender(
-                        chat_id=chat_id, 
-                        **{param: f},
-                        reply_parameters=reply_params
-                    )
-            except Exception as e:
-                filename = media_path.rsplit("/", 1)[-1]
-                logger.error("Failed to send media {}: {}", media_path, e)
-                await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"[Failed to send: {filename}]",
-                    reply_parameters=reply_params
-                )
-
-        # Send text content
-        if msg.content and msg.content != "[empty message]":
-            for chunk in _split_message(msg.content):
-                try:
-                    html = _markdown_to_telegram_html(chunk)
-                    await self._app.bot.send_message(
-                        chat_id=chat_id, 
-                        text=html, 
-                        parse_mode="HTML",
-                        reply_parameters=reply_params
-                    )
-                except Exception as e:
-                    logger.warning("HTML parse failed, falling back to plain text: {}", e)
-                    try:
-                        await self._app.bot.send_message(
-                            chat_id=chat_id, 
-                            text=chunk,
-                            reply_parameters=reply_params
-                        )
-                    except Exception as e2:
-                        logger.error("Error sending Telegram message: {}", e2)
-    
-    async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /start command."""
-        if not update.message or not update.effective_user:
-            return
-
-        user = update.effective_user
-        await update.message.reply_text(
-            f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
-            "Send me a message and I'll respond!\n"
-            "Type /help to see available commands."
-        )
-
-    async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /help command, bypassing ACL so all users can access it."""
-        if not update.message:
-            return
-        await update.message.reply_text(
-            "🐈 nanobot commands:\n"
-            "/new — Start a new conversation\n"
-            "/stop — Stop the current task\n"
-            "/help — Show available commands"
-        )
+    @staticmethod
+    def _pending_key(chat_id: int, sender_id: str) -> str:
+        return f"{chat_id}:{sender_id}"
 
     @staticmethod
-    def _sender_id(user) -> str:
-        """Build sender_id with username for allowlist matching."""
-        sid = str(user.id)
-        return f"{sid}|{user.username}" if user.username else sid
+    def _is_command_text(text: str) -> bool:
+        return text.lstrip().startswith("/")
 
     @staticmethod
-    def _format_reply_user(user) -> str:
+    def _build_metadata(message: Message | None, user: User | None) -> dict[str, Any]:
+        if not message or not user:
+            return {}
+        return {
+            "message_id": message.message_id,
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "is_group": message.chat.type != "private",
+        }
+
+    @staticmethod
+    def _format_reply_user(user: User | None) -> str:
         if not user:
             return "Unknown"
         if user.first_name and user.username:
@@ -330,7 +302,7 @@ class TelegramChannel(BaseChannel):
         return str(user.id)
 
     @staticmethod
-    def _summarize_reply_media(reply) -> str:
+    def _summarize_reply_media(reply: Message) -> str:
         parts: list[str] = []
         if getattr(reply, "photo", None):
             parts.append("photo")
@@ -367,8 +339,8 @@ class TelegramChannel(BaseChannel):
 
     @classmethod
     def _extract_reply_context(
-        cls, message
-    ) -> tuple[str | None, dict, str | None]:
+        cls, message: Message | None
+    ) -> tuple[str | None, dict[str, Any], str | None]:
         if not message:
             return None, {}, None
         reply = getattr(message, "reply_to_message", None)
@@ -381,7 +353,7 @@ class TelegramChannel(BaseChannel):
         reply_message_id = getattr(reply, "message_id", None)
         reply_date = getattr(reply, "date", None)
 
-        metadata = {
+        metadata: dict[str, Any] = {
             "reply_to_message_id": reply_message_id,
             "reply_to_user_id": getattr(reply_user, "id", None),
             "reply_to_username": getattr(reply_user, "username", None),
@@ -411,14 +383,432 @@ class TelegramChannel(BaseChannel):
         reply_key = str(reply_message_id) if reply_message_id is not None else None
         return "\n".join(lines), metadata, reply_key
 
-    async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Forward slash commands to the bus for unified handling in AgentLoop."""
+    async def _send_typing(self, chat_id: int) -> None:
+        if not self._app:
+            return
+        try:
+            await self._app.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except Exception as e:
+            logger.debug(f"Failed to send typing action: {e}")
+
+    async def _send_reaction(self, chat_id: int, message_id: int, emoji: str) -> None:
+        if not self._app:
+            return
+        emoji = self._normalize_reaction_emoji(emoji)
+        if not emoji:
+            return
+        try:
+            await self._app.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=emoji,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to set reaction: {e}")
+
+    async def _schedule_feedback_reaction(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        emoji: str,
+    ) -> None:
+        if not message_id:
+            return
+        if self._typing_feedback_delay_s <= 0 and self._typing_feedback_grace_s <= 0:
+            return
+        entry = _PendingFeedback(chat_id=chat_id, message_id=message_id, emoji=emoji)
+        async with self._feedback_lock:
+            existing = self._pending_feedback.get(chat_id)
+            if existing and existing.timer:
+                existing.timer.cancel()
+            entry.timer = asyncio.create_task(self._feedback_after_delay(chat_id, entry))
+            self._pending_feedback[chat_id] = entry
+
+    async def _feedback_after_delay(self, chat_id: int, entry: _PendingFeedback) -> None:
+        delay_s = self._typing_feedback_delay_s
+        min_delay = self._typing_window_s + self._typing_feedback_grace_s
+        if delay_s < min_delay:
+            delay_s = min_delay
+        try:
+            await asyncio.sleep(delay_s)
+        except asyncio.CancelledError:
+            return
+        async with self._feedback_lock:
+            current = self._pending_feedback.get(chat_id)
+            if current is not entry:
+                return
+            entry.timer = None
+            entry.sent = True
+            emoji = entry.emoji
+        if entry.message_id:
+            await self._send_reaction(chat_id, entry.message_id, emoji)
+
+    async def _cancel_feedback(self, chat_id: int) -> None:
+        async with self._feedback_lock:
+            entry = self._pending_feedback.pop(chat_id, None)
+            if entry and entry.timer:
+                entry.timer.cancel()
+
+    async def _update_feedback_emoji(
+        self,
+        chat_id: int,
+        message_id: int | None,
+        emoji: str,
+    ) -> None:
+        if not message_id:
+            return
+        emoji = self._normalize_reaction_emoji(emoji)
+        if not emoji:
+            return
+        send_now = False
+        async with self._feedback_lock:
+            entry = self._pending_feedback.get(chat_id)
+            if not entry or entry.message_id != message_id:
+                return
+            entry.emoji = emoji
+            send_now = entry.sent
+        if send_now:
+            await self._send_reaction(chat_id, message_id, emoji)
+
+    def _normalize_reaction_emoji(self, emoji: str | None) -> str | None:
+        if not emoji:
+            return None
+        if emoji.isdigit():
+            return emoji
+        if emoji in self._allowed_reactions:
+            return emoji
+        fallback = self._typing_feedback_emoji or "👀"
+        if fallback.isdigit():
+            return fallback
+        if fallback in self._allowed_reactions:
+            return fallback
+        if "👀" in self._allowed_reactions:
+            return "👀"
+        return next(iter(self._allowed_reactions), None)
+
+    def _pick_from_pool(self, pool: list[str], seed: int | None) -> str:
+        allowed_pool = [e for e in pool if e in self._allowed_reactions]
+        if not allowed_pool:
+            fallback_pool = [e for e in (self._typing_feedback_emoji, "👀") if e in self._allowed_reactions]
+            allowed_pool = fallback_pool or list(self._allowed_reactions)
+        if not allowed_pool:
+            return ""
+        if seed is None:
+            import random
+            return random.choice(allowed_pool)
+        return allowed_pool[abs(int(seed)) % len(allowed_pool)]
+
+    def _pick_text_feedback_emoji(
+        self,
+        content: str,
+        has_media: bool = False,
+        is_command: bool = False,
+        seed: int | None = None,
+    ) -> str:
+        if has_media:
+            return self._pick_from_pool(["📎", "📁", "📄"], seed)
+        if is_command:
+            return self._pick_from_pool(["🛠️", "🔧", "🧪"], seed)
+        lower = content.lower()
+        if any(k in lower for k in ("http://", "https://", "search", "news", "查", "搜索", "资料", "链接", "url")):
+            return self._pick_from_pool(["🔍", "🧭"], seed)
+        if any(k in lower for k in ("error", "bug", "build", "compile", "deploy", "报错", "日志", "编译", "部署")):
+            return self._pick_from_pool(["🛠️", "🔧", "🧪"], seed)
+        if any(k in lower for k in ("file", "upload", "download", "附件", "文件", "上传", "下载")):
+            return self._pick_from_pool(["📎", "📁", "📄"], seed)
+        if any(k in lower for k in ("summary", "summarize", "总结", "梳理", "概览")):
+            return self._pick_from_pool(["🧾", "🗂️"], seed)
+        if any(k in lower for k in ("translate", "translation", "翻译")):
+            return self._pick_from_pool(["🌐", "🗺️"], seed)
+        if any(k in lower for k in ("cron", "schedule", "remind", "提醒", "定时")):
+            return self._pick_from_pool(["⏰", "🗓️"], seed)
+        return self._pick_from_pool([self._typing_feedback_emoji, "👀", "⏳", "🧠"], seed)
+
+    def _pick_tool_feedback_emoji(self, tool_name: str, seed: int | None = None) -> str:
+        emoji = self._normalize_reaction_emoji(self._typing_feedback_long_emoji)
+        if emoji:
+            return emoji
+        return self._pick_from_pool([self._typing_feedback_emoji, "👀"], seed)
+
+    async def _emit_text_entry(self, entry: _PendingTextEntry, joiner: str) -> None:
+        content = joiner.join(entry.texts).strip()
+        if entry.reply_prefix:
+            if content:
+                content = f"{entry.reply_prefix}\n\n{content}"
+            else:
+                content = entry.reply_prefix
+        if not content:
+            return
+        await self._send_typing(entry.chat_id)
+        emoji = self._pick_text_feedback_emoji(content, seed=entry.last_message_id)
+        await self._schedule_feedback_reaction(entry.chat_id, entry.last_message_id, emoji)
+        await self._handle_message(
+            sender_id=entry.sender_id,
+            chat_id=str(entry.chat_id),
+            content=content,
+            media=[],
+            metadata=entry.metadata,
+        )
+
+    async def _schedule_debounce_flush(self, key: str, entry: _PendingTextEntry) -> None:
+        try:
+            await asyncio.sleep(self._debounce_ms / 1000)
+        except asyncio.CancelledError:
+            return
+        async with self._pending_lock:
+            current = self._debounce_entries.get(key)
+            if current is not entry:
+                return
+            self._debounce_entries.pop(key, None)
+        await self._emit_text_entry(entry, "\n")
+
+    async def _schedule_text_fragment_flush(self, key: str, entry: _PendingTextEntry) -> None:
+        try:
+            await asyncio.sleep(self._text_fragment_max_gap_ms / 1000)
+        except asyncio.CancelledError:
+            return
+        async with self._pending_lock:
+            current = self._text_fragment_entries.get(key)
+            if current is not entry:
+                return
+            self._text_fragment_entries.pop(key, None)
+        await self._emit_text_entry(entry, "")
+
+    async def _enqueue_debounced_text(self, key: str, entry: _PendingTextEntry, text: str) -> None:
+        to_flush: _PendingTextEntry | None = None
+        async with self._pending_lock:
+            existing = self._debounce_entries.get(key)
+            if existing:
+                if existing.reply_key != entry.reply_key:
+                    if existing.timer:
+                        existing.timer.cancel()
+                    self._debounce_entries.pop(key, None)
+                    to_flush = existing
+                else:
+                    existing.texts.append(text)
+                    existing.metadata = entry.metadata
+                    if entry.reply_prefix and not existing.reply_prefix:
+                        existing.reply_prefix = entry.reply_prefix
+                    existing.last_message_id = entry.last_message_id
+                    existing.last_received_at = entry.last_received_at
+                    if existing.timer:
+                        existing.timer.cancel()
+                    existing.timer = asyncio.create_task(self._schedule_debounce_flush(key, existing))
+                    return
+            entry.texts = [text]
+            entry.timer = asyncio.create_task(self._schedule_debounce_flush(key, entry))
+            self._debounce_entries[key] = entry
+        if to_flush:
+            await self._emit_text_entry(to_flush, "\n")
+
+    async def _enqueue_text_fragment(self, key: str, entry: _PendingTextEntry, text: str) -> None:
+        to_flush: _PendingTextEntry | None = None
+        async with self._pending_lock:
+            existing = self._text_fragment_entries.get(key)
+            if existing:
+                id_gap = (entry.last_message_id or 0) - (existing.last_message_id or 0)
+                time_gap = entry.last_received_at - existing.last_received_at
+                same_reply = existing.reply_key == entry.reply_key
+                can_append = (
+                    id_gap > 0
+                    and id_gap <= self._text_fragment_max_id_gap
+                    and time_gap >= 0
+                    and time_gap <= (self._text_fragment_max_gap_ms / 1000)
+                    and same_reply
+                )
+                total_chars = sum(len(t) for t in existing.texts) + len(text)
+                if (
+                    can_append
+                    and len(existing.texts) + 1 <= self._text_fragment_max_parts
+                    and total_chars <= self._text_fragment_max_total_chars
+                ):
+                    existing.texts.append(text)
+                    existing.metadata = entry.metadata
+                    if entry.reply_prefix and not existing.reply_prefix:
+                        existing.reply_prefix = entry.reply_prefix
+                    existing.last_message_id = entry.last_message_id
+                    existing.last_received_at = entry.last_received_at
+                    if existing.timer:
+                        existing.timer.cancel()
+                    existing.timer = asyncio.create_task(
+                        self._schedule_text_fragment_flush(key, existing)
+                    )
+                    return
+                # Flush existing if we can't append this fragment
+                if existing.timer:
+                    existing.timer.cancel()
+                self._text_fragment_entries.pop(key, None)
+                to_flush = existing
+
+            entry.texts = [text]
+            entry.timer = asyncio.create_task(self._schedule_text_fragment_flush(key, entry))
+            self._text_fragment_entries[key] = entry
+
+        if to_flush:
+            await self._emit_text_entry(to_flush, "")
+
+    async def _flush_pending_for_key(self, key: str) -> None:
+        debounce_entry: _PendingTextEntry | None = None
+        fragment_entry: _PendingTextEntry | None = None
+        async with self._pending_lock:
+            debounce_entry = self._debounce_entries.pop(key, None)
+            fragment_entry = self._text_fragment_entries.pop(key, None)
+            if debounce_entry and debounce_entry.timer:
+                debounce_entry.timer.cancel()
+            if fragment_entry and fragment_entry.timer:
+                fragment_entry.timer.cancel()
+        if fragment_entry:
+            await self._emit_text_entry(fragment_entry, "")
+        if debounce_entry:
+            await self._emit_text_entry(debounce_entry, "\n")
+    
+    async def stop(self) -> None:
+        """Stop the Telegram bot."""
+        self._running = False
+
+        pending: list[_PendingTextEntry] = []
+        async with self._pending_lock:
+            pending.extend(self._debounce_entries.values())
+            pending.extend(self._text_fragment_entries.values())
+            self._debounce_entries.clear()
+            self._text_fragment_entries.clear()
+        for entry in pending:
+            if entry.timer:
+                entry.timer.cancel()
+        async with self._feedback_lock:
+            for entry in self._pending_feedback.values():
+                if entry.timer:
+                    entry.timer.cancel()
+            self._pending_feedback.clear()
+        
+        if self._app:
+            logger.info("Stopping Telegram bot...")
+            await self._app.updater.stop()
+            await self._app.stop()
+            await self._app.shutdown()
+            self._app = None
+    
+    async def send(self, msg: OutboundMessage) -> None:
+        """Send a message through Telegram."""
+        if not self._app:
+            logger.warning("Telegram bot not running")
+            return
+
+        try:
+            # chat_id should be the Telegram chat ID (integer)
+            chat_id = int(msg.chat_id)
+        except ValueError:
+            logger.error(f"Invalid chat_id: {msg.chat_id}")
+            return
+
+        reaction_message_id = None
+        reaction_emoji = None
+        reaction_hint = None
+        reaction_only = False
+        if msg.metadata:
+            reaction_message_id = msg.metadata.get("reaction_message_id")
+            reaction_emoji = msg.metadata.get("reaction_emoji")
+            reaction_hint = msg.metadata.get("reaction_hint")
+            reaction_only = bool(msg.metadata.get("reaction_only"))
+
+        if reaction_message_id and (reaction_emoji or reaction_hint):
+            emoji = reaction_emoji or self._pick_tool_feedback_emoji(
+                str(reaction_hint),
+                seed=int(reaction_message_id),
+            )
+            if emoji:
+                await self._update_feedback_emoji(chat_id, int(reaction_message_id), emoji)
+            if reaction_only and not msg.content and not msg.media:
+                return
+
+        if msg.content or msg.media:
+            await self._cancel_feedback(chat_id)
+
+        reply_markup = None
+        buttons = None
+        if msg.metadata:
+            buttons = msg.metadata.get("buttons")
+        if isinstance(buttons, list) and buttons:
+            keyboard: list[list[InlineKeyboardButton]] = []
+            for item in buttons:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                url = item.get("url")
+                if text and url:
+                    keyboard.append([InlineKeyboardButton(text=text, url=url)])
+            if keyboard:
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+        # 1) Send text content as a separate message (or edit if requested).
+        if msg.content:
+            edit_message_id = None
+            if msg.metadata:
+                edit_message_id = msg.metadata.get("edit_message_id")
+            try:
+                html_content = _markdown_to_telegram_html(msg.content)
+                if edit_message_id:
+                    try:
+                        await self._app.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=int(edit_message_id),
+                            text=html_content,
+                            parse_mode="HTML",
+                            reply_markup=reply_markup,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error editing Telegram message: {e}")
+                        await self._app.bot.send_message(
+                            chat_id=chat_id,
+                            text=html_content,
+                            parse_mode="HTML",
+                            reply_markup=reply_markup,
+                        )
+                else:
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=html_content,
+                        parse_mode="HTML",
+                        reply_markup=reply_markup,
+                    )
+            except Exception as e:
+                # Fallback to plain text if HTML parsing fails
+                logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+                try:
+                    if edit_message_id:
+                        await self._app.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=int(edit_message_id),
+                            text=msg.content,
+                            reply_markup=reply_markup,
+                        )
+                    else:
+                        await self._app.bot.send_message(
+                            chat_id=chat_id,
+                            text=msg.content,
+                            reply_markup=reply_markup,
+                        )
+                except Exception as e2:
+                    logger.error(f"Error sending Telegram message: {e2}")
+
+        # 2) Send media attachments as separate messages.
+        if not msg.media:
+            return
+
+        for item in msg.media:
+            try:
+                await self._send_media(chat_id, item)
+            except Exception as e:
+                logger.error(f"Error sending media {item}: {e}")
+    
+    async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /start command."""
         if not update.message or not update.effective_user:
             return
-        await self._handle_message(
-            sender_id=self._sender_id(update.effective_user),
-            chat_id=str(update.message.chat_id),
-            content=update.message.text,
+        
+        user = update.effective_user
+        await update.message.reply_text(
+            f"👋 Hi {user.first_name}!"
         )
     
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -429,14 +819,59 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
-        sender_id = self._sender_id(user)
+        
+        # Use stable numeric ID, but keep username for allowlist compatibility
+        sender_id = str(user.id)
+        if user.username:
+            sender_id = f"{sender_id}|{user.username}"
         
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
+
+        text_content = message.text or message.caption or ""
+        has_media = bool(message.photo or message.voice or message.audio or message.document)
+        is_command = bool(message.text and self._is_command_text(message.text))
+        key = self._pending_key(chat_id, sender_id)
+        metadata = self._build_metadata(message, user)
+        reply_prefix, reply_metadata, reply_key = self._extract_reply_context(message)
+        if reply_metadata:
+            metadata.update(reply_metadata)
+
+        # Debounce and merge text-only messages (skip commands).
+        if text_content and not has_media and not is_command:
+            entry = _PendingTextEntry(
+                sender_id=sender_id,
+                chat_id=chat_id,
+                texts=[text_content],
+                metadata=metadata,
+                reply_prefix=reply_prefix,
+                reply_key=reply_key,
+                last_message_id=message.message_id,
+                last_received_at=time.monotonic(),
+            )
+            if len(text_content) >= self._text_fragment_start_threshold:
+                await self._enqueue_text_fragment(key, entry, text_content)
+            else:
+                await self._enqueue_debounced_text(key, entry, text_content)
+            return
+
+        # Flush any pending text before handling media/commands to preserve ordering.
+        await self._flush_pending_for_key(key)
+        await self._send_typing(chat_id)
+        emoji = self._pick_text_feedback_emoji(
+            text_content,
+            has_media=has_media,
+            is_command=is_command,
+            seed=message.message_id,
+        )
+        await self._schedule_feedback_reaction(chat_id, message.message_id, emoji)
         
         # Build content from text and/or media
         content_parts = []
         media_paths = []
+
+        if reply_prefix:
+            content_parts.append(reply_prefix)
         
         # Text content
         if message.text:
@@ -465,11 +900,14 @@ class TelegramChannel(BaseChannel):
         if media_file and self._app:
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
-                ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
+                ext = self._get_extension(
+                    media_type,
+                    getattr(media_file, "mime_type", None),
+                    getattr(media_file, "file_name", None),
+                )
                 
                 # Save to workspace/media/
-                from pathlib import Path
-                media_dir = Path.home() / ".nanobot" / "media"
+                media_dir = get_data_path() / "media"
                 media_dir.mkdir(parents=True, exist_ok=True)
                 
                 file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
@@ -483,112 +921,47 @@ class TelegramChannel(BaseChannel):
                     transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
                     transcription = await transcriber.transcribe(file_path)
                     if transcription:
-                        logger.info("Transcribed {}: {}...", media_type, transcription[:50])
+                        logger.info(f"Transcribed {media_type}: {transcription[:50]}...")
                         content_parts.append(f"[transcription: {transcription}]")
                     else:
                         content_parts.append(f"[{media_type}: {file_path}]")
                 else:
                     content_parts.append(f"[{media_type}: {file_path}]")
                     
-                logger.debug("Downloaded {} to {}", media_type, file_path)
+                logger.debug(f"Downloaded {media_type} to {file_path}")
             except Exception as e:
-                logger.error("Failed to download media: {}", e)
+                logger.error(f"Failed to download media: {e}")
                 content_parts.append(f"[{media_type}: download failed]")
         
         content = "\n".join(content_parts) if content_parts else "[empty message]"
         
-        logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
-        
-        str_chat_id = str(chat_id)
-
-        # Telegram media groups: buffer briefly, forward as one aggregated turn.
-        if media_group_id := getattr(message, "media_group_id", None):
-            key = f"{str_chat_id}:{media_group_id}"
-            if key not in self._media_group_buffers:
-                self._media_group_buffers[key] = {
-                    "sender_id": sender_id, "chat_id": str_chat_id,
-                    "contents": [], "media": [],
-                    "metadata": {
-                        "message_id": message.message_id, "user_id": user.id,
-                        "username": user.username, "first_name": user.first_name,
-                        "is_group": message.chat.type != "private",
-                    },
-                }
-                self._start_typing(str_chat_id)
-            buf = self._media_group_buffers[key]
-            if content and content != "[empty message]":
-                buf["contents"].append(content)
-            buf["media"].extend(media_paths)
-            if key not in self._media_group_tasks:
-                self._media_group_tasks[key] = asyncio.create_task(self._flush_media_group(key))
-            return
-        
-        # Start typing indicator before processing
-        self._start_typing(str_chat_id)
+        logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
         
         # Forward to the message bus
         await self._handle_message(
             sender_id=sender_id,
-            chat_id=str_chat_id,
+            chat_id=str(chat_id),
             content=content,
             media=media_paths,
-            metadata={
-                "message_id": message.message_id,
-                "user_id": user.id,
-                "username": user.username,
-                "first_name": user.first_name,
-                "is_group": message.chat.type != "private"
-            }
+            metadata=metadata,
         )
     
-    async def _flush_media_group(self, key: str) -> None:
-        """Wait briefly, then forward buffered media-group as one turn."""
-        try:
-            await asyncio.sleep(0.6)
-            if not (buf := self._media_group_buffers.pop(key, None)):
-                return
-            content = "\n".join(buf["contents"]) or "[empty message]"
-            await self._handle_message(
-                sender_id=buf["sender_id"], chat_id=buf["chat_id"],
-                content=content, media=list(dict.fromkeys(buf["media"])),
-                metadata=buf["metadata"],
-            )
-        finally:
-            self._media_group_tasks.pop(key, None)
-
-    def _start_typing(self, chat_id: str) -> None:
-        """Start sending 'typing...' indicator for a chat."""
-        # Cancel any existing typing task for this chat
-        self._stop_typing(chat_id)
-        self._typing_tasks[chat_id] = asyncio.create_task(self._typing_loop(chat_id))
-    
-    def _stop_typing(self, chat_id: str) -> None:
-        """Stop the typing indicator for a chat."""
-        task = self._typing_tasks.pop(chat_id, None)
-        if task and not task.done():
-            task.cancel()
-    
-    async def _typing_loop(self, chat_id: str) -> None:
-        """Repeatedly send 'typing' action until cancelled."""
-        try:
-            while self._app:
-                await self._app.bot.send_chat_action(chat_id=int(chat_id), action="typing")
-                await asyncio.sleep(4)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
-    
-    async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Log polling / handler errors instead of silently swallowing them."""
-        logger.error("Telegram error: {}", context.error)
-
-    def _get_extension(self, media_type: str, mime_type: str | None) -> str:
+    def _get_extension(
+        self,
+        media_type: str,
+        mime_type: str | None,
+        filename: str | None = None,
+    ) -> str:
         """Get file extension based on media type."""
+        if filename:
+            ext = Path(filename).suffix
+            if ext:
+                return ext
         if mime_type:
             ext_map = {
                 "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
                 "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+                "application/pdf": ".pdf",
             }
             if mime_type in ext_map:
                 return ext_map[mime_type]
